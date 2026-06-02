@@ -27,6 +27,7 @@
 #include <ArduinoJson.h>
 #include <XPT2046_Touchscreen.h>
 #include <math.h>
+#include <esp_system.h>   // esp_reset_reason() untuk diagnosa penyebab restart
 
 // ---------------- PIN ----------------
 #define PIN_BUZZER   13
@@ -665,6 +666,7 @@ void handleCmd(JsonDocument& doc) {
   } else if (cmd == "flush") {
     bool on = doc["on"] | false;
     if (state == ST_IDLE) {
+      Serial.printf("[FLUSH] %s  heap=%u\n", on?"ON":"OFF", ESP.getFreeHeap());
       flushManual = on;
       setMotor(on);
       broadcastState();
@@ -1326,6 +1328,7 @@ void handleIdleTouch(int x, int y) {
     enterState(ST_SELECT_IDX);
   } else if (tapped(btnIdleFlush, x, y)) {
     flushManual = !flushManual;
+    Serial.printf("[FLUSH-TFT] %s  heap=%u\n", flushManual?"ON":"OFF", ESP.getFreeHeap());
     setMotor(flushManual);
     broadcastState();
     // Tidak full-redraw (berat). tftUpdateIdleValues() akan repaint tombol flush
@@ -1435,6 +1438,22 @@ void setup() {
   Serial.println();
   Serial.println("=== BOOT ===");
   Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
+  // Diagnosa: kenapa ESP32 baru saja restart?
+  esp_reset_reason_t rr = esp_reset_reason();
+  const char* rrStr;
+  switch (rr) {
+    case ESP_RST_POWERON:  rrStr = "POWERON (normal)"; break;
+    case ESP_RST_SW:       rrStr = "SW (ESP.restart / reflash)"; break;
+    case ESP_RST_PANIC:    rrStr = "PANIC (crash/exception - cek backtrace!)"; break;
+    case ESP_RST_INT_WDT:  rrStr = "INT_WDT (interrupt watchdog)"; break;
+    case ESP_RST_TASK_WDT: rrStr = "TASK_WDT (loop block > watchdog)"; break;
+    case ESP_RST_WDT:      rrStr = "WDT (other watchdog)"; break;
+    case ESP_RST_BROWNOUT: rrStr = "BROWNOUT (tegangan drop - kemungkinan relay/motor!)"; break;
+    case ESP_RST_DEEPSLEEP:rrStr = "DEEPSLEEP"; break;
+    case ESP_RST_EXT:      rrStr = "EXT (reset pin)"; break;
+    default:               rrStr = "UNKNOWN"; break;
+  }
+  Serial.printf(">>> RESET REASON: %s\n", rrStr);
 
   // --- GPIO (sebelum TFT) ---
   pinMode(PIN_BUZZER, OUTPUT); digitalWrite(PIN_BUZZER, LOW);
