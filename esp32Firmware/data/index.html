@@ -431,7 +431,9 @@
             <tr class="text-ink-500 border-b border-ink-100">
               <th class="text-left px-3 py-2 text-xs uppercase tracking-wider font-semibold">#</th>
               <th class="text-left px-3 py-2 text-xs uppercase tracking-wider font-semibold">Waktu</th>
-              <th class="text-left px-3 py-2 text-xs uppercase tracking-wider font-semibold">Index</th>
+              <th class="text-left px-3 py-2 text-xs uppercase tracking-wider font-semibold">Kendaraan</th>
+              <th class="text-left px-3 py-2 text-xs uppercase tracking-wider font-semibold">Plat</th>
+              <th class="text-left px-3 py-2 text-xs uppercase tracking-wider font-semibold">Kategori</th>
               <th class="text-right px-3 py-2 text-xs uppercase tracking-wider font-semibold">AVG HC</th>
               <th class="text-right px-3 py-2 text-xs uppercase tracking-wider font-semibold">AVG CO</th>
               <th class="text-left px-3 py-2 text-xs uppercase tracking-wider font-semibold">Hasil</th>
@@ -589,6 +591,32 @@
       <button id="btnLogDetailClose" class="text-ink-400 hover:text-ink-700">
         <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
       </button>
+    </div>
+    <!-- Form data kendaraan (editable) -->
+    <div class="border border-ink-100 rounded-xl p-4 my-3 bg-ink-50/50">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-xs font-semibold text-ink-600 uppercase tracking-wider">Data Kendaraan</div>
+        <span class="text-[11px] text-ink-400">Kategori (saat uji): <b id="logEditKategori" class="text-ink-700">-</b></span>
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <label class="block">
+          <span class="text-xs font-medium text-ink-600">Nama Kendaraan</span>
+          <input type="text" id="logEditVehicle" maxlength="40" placeholder="cth: Honda Beat 2015"
+            class="mt-1 w-full px-3 py-2 border border-ink-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500">
+        </label>
+        <label class="block">
+          <span class="text-xs font-medium text-ink-600">Nomor Plat</span>
+          <input type="text" id="logEditPlate" maxlength="20" placeholder="cth: N 1234 AB"
+            class="mt-1 w-full px-3 py-2 border border-ink-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500 uppercase">
+        </label>
+      </div>
+      <div class="flex items-center gap-3 mt-3">
+        <button id="btnLogSaveMeta" class="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold transition disabled:opacity-50">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>
+          Simpan Data Kendaraan
+        </button>
+        <span id="logMetaMsg" class="text-sm font-medium"></span>
+      </div>
     </div>
     <div class="grid grid-cols-2 gap-3 my-3">
       <div class="rounded-xl bg-blue-50 p-3">

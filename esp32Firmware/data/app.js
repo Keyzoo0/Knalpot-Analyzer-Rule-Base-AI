@@ -436,7 +436,7 @@ const RESULT_BADGES = [
 
 async function fetchLogs(){
   const body = document.getElementById('logBody');
-  body.innerHTML = '<tr><td colspan="7" class="text-center py-6 text-ink-400">Memuat...</td></tr>';
+  body.innerHTML = '<tr><td colspan="9" class="text-center py-6 text-ink-400">Memuat...</td></tr>';
   document.getElementById('logEmpty').classList.add('hidden');
   document.getElementById('logSdWarn').classList.add('hidden');
   try {
@@ -460,9 +460,13 @@ async function fetchLogs(){
       const tx = RESULT_BADGES[e.code]?.tx || 'text-ink-700';
       const tr = document.createElement('tr');
       tr.className = 'hover:bg-ink-50';
+      const vehicle = (e.vehicle || '').trim();
+      const plate   = (e.plate || '').trim();
       tr.innerHTML = `
         <td class="px-3 py-2 mono text-ink-400">#${e.id}</td>
         <td class="px-3 py-2 mono text-xs">${e.ts || '-'}</td>
+        <td class="px-3 py-2">${vehicle ? escapeHtml(vehicle) : '<span class="text-ink-300 italic">—</span>'}</td>
+        <td class="px-3 py-2 mono uppercase">${plate ? escapeHtml(plate) : '<span class="text-ink-300 italic">—</span>'}</td>
         <td class="px-3 py-2">${escapeHtml(e.idx || '-')}</td>
         <td class="px-3 py-2 mono text-right">${(+e.avg_hc).toFixed(1)}</td>
         <td class="px-3 py-2 mono text-right">${(+e.avg_co).toFixed(2)}</td>
@@ -478,7 +482,7 @@ async function fetchLogs(){
       b.addEventListener('click', () => openLogDetail(+b.dataset.detail));
     });
   } catch(e) {
-    body.innerHTML = '<tr><td colspan="7" class="text-center py-6 text-red-500">Gagal memuat log</td></tr>';
+    body.innerHTML = '<tr><td colspan="9" class="text-center py-6 text-red-500">Gagal memuat log</td></tr>';
   }
 }
 
@@ -486,14 +490,22 @@ function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+let logEditId = null;   // id entry yang sedang dibuka di modal detail
+
 async function openLogDetail(id){
   try {
     const r = await fetch('/api/log?id=' + id);
     if (!r.ok) return alert('Log tidak ditemukan');
     const d = await r.json();
+    logEditId = id;
     document.getElementById('logDetailTitle').textContent = d.label || '-';
     document.getElementById('logDetailMeta').textContent =
       `${d.ts || '-'}  ·  ${d.idx_label || '-'}  ·  ${d.n} sample`;
+    // Form data kendaraan (editable)
+    document.getElementById('logEditVehicle').value = d.vehicle || '';
+    document.getElementById('logEditPlate').value   = d.plate || '';
+    document.getElementById('logEditKategori').textContent = d.idx_label || '-';
+    document.getElementById('logMetaMsg').textContent = '';
     document.getElementById('logDetailHC').textContent = (+d.avg_hc).toFixed(1);
     document.getElementById('logDetailCO').textContent = (+d.avg_co).toFixed(2);
     document.getElementById('logDetailThHC').textContent = d.th_hc;
@@ -529,6 +541,37 @@ async function openLogDetail(id){
 
 document.getElementById('btnLogDetailClose').addEventListener('click', () => {
   document.getElementById('modalLogDetail').classList.add('hidden');
+});
+document.getElementById('btnLogSaveMeta').addEventListener('click', async () => {
+  if (logEditId === null) return;
+  const btn = document.getElementById('btnLogSaveMeta');
+  const msg = document.getElementById('logMetaMsg');
+  const vehicle = document.getElementById('logEditVehicle').value.trim();
+  const plate   = document.getElementById('logEditPlate').value.trim().toUpperCase();
+  btn.disabled = true;
+  msg.textContent = 'Menyimpan...';
+  msg.className = 'text-sm font-medium text-amber-700';
+  try {
+    const r = await fetch('/api/log/edit?id=' + logEditId, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ vehicle, plate })
+    });
+    const j = await r.json();
+    if (j.ok) {
+      msg.textContent = '✓ Tersimpan';
+      msg.className = 'text-sm font-medium text-emerald-600';
+      fetchLogs();   // refresh tabel agar kolom kendaraan/plat update
+    } else {
+      msg.textContent = '✗ ' + (j.err || 'gagal');
+      msg.className = 'text-sm font-medium text-red-600';
+    }
+  } catch(e) {
+    msg.textContent = '✗ koneksi gagal';
+    msg.className = 'text-sm font-medium text-red-600';
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => { msg.textContent = ''; }, 3000);
+  }
 });
 document.getElementById('btnLogRefresh').addEventListener('click', fetchLogs);
 document.getElementById('btnLogClear').addEventListener('click', async () => {

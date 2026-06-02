@@ -176,6 +176,7 @@ float    sampleCO[MAX_SAMPLES];
 // SD card
 bool sd_ok = false;
 const char* LOG_PATH = "/logs.jsonl";   // JSON-lines: 1 baris = 1 log entry
+const char* LOG_TMP  = "/logs.tmp";     // file sementara saat rewrite (edit entry)
 
 // Latest readings
 float lastHC = 0, lastCO = 0;
@@ -487,6 +488,8 @@ void saveLogEntry() {
   JsonDocument d;
   d["ts"]    = currentTimestamp();
   d["up"]    = (uint32_t)(millis() / 1000);
+  d["vehicle"] = "";   // nama kendaraan — diisi/diedit dari web (TFT tanpa keyboard)
+  d["plate"]   = "";   // nomor plat — diisi/diedit dari web
   d["idx_label"] = (selectedIndex>=0) ? cfg.indices[selectedIndex].label : String("?");
   d["th_hc"] = (selectedIndex>=0) ? cfg.indices[selectedIndex].th_hc : 0;
   d["th_co"] = (selectedIndex>=0) ? cfg.indices[selectedIndex].th_co : 0;
@@ -507,6 +510,46 @@ void saveLogEntry() {
   f.print('\n');
   f.close();
   Serial.println("[LOG] saved");
+}
+
+// Edit metadata (vehicle & plate) 1 entry log berdasarkan id (= indeks baris).
+// Rewrite streaming baris-per-baris ke file temp lalu rename — hemat heap walau
+// log besar (tidak memuat seluruh file ke RAM, hanya 1 baris target yang di-parse).
+bool editLogEntry(int wantId, const String& vehicle, const String& plate) {
+  if (!sd_ok || !SD.exists(LOG_PATH)) return false;
+  File in = SD.open(LOG_PATH, FILE_READ);
+  if (!in) return false;
+  if (SD.exists(LOG_TMP)) SD.remove(LOG_TMP);
+  File out = SD.open(LOG_TMP, FILE_WRITE);
+  if (!out) { in.close(); return false; }
+
+  int id = 0;
+  bool edited = false;
+  while (in.available()) {
+    String line = in.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (id == wantId) {
+      JsonDocument d;
+      if (!deserializeJson(d, line)) {
+        d["vehicle"] = vehicle;
+        d["plate"]   = plate;
+        serializeJson(d, out);
+        edited = true;
+      } else {
+        out.print(line);   // baris korup: tulis apa adanya
+      }
+    } else {
+      out.print(line);
+    }
+    out.print('\n');
+    id++;
+  }
+  in.close();
+  out.close();
+  if (!edited) { SD.remove(LOG_TMP); return false; }
+  SD.remove(LOG_PATH);
+  return SD.rename(LOG_TMP, LOG_PATH);
 }
 
 // ---------------- State machine transitions ----------------
@@ -748,8 +791,10 @@ void registerRoutes() {
       JsonDocument d;
       if (deserializeJson(d, line)) { id++; continue; }
       JsonObject o = arr.add<JsonObject>();
-      o["id"]     = id;
-      o["ts"]     = d["ts"].as<String>();
+      o["id"]      = id;
+      o["ts"]      = d["ts"].as<String>();
+      o["vehicle"] = d["vehicle"] | "";   // entry lama tanpa field -> string kosong
+      o["plate"]   = d["plate"]   | "";
       o["idx"]    = d["idx_label"].as<String>();
       o["avg_hc"] = d["avg_hc"].as<float>();
       o["avg_co"] = d["avg_co"].as<float>();
@@ -786,6 +831,26 @@ void registerRoutes() {
     f.close();
     req->send(404, "application/json", "{\"err\":\"id_not_found\"}");
   });
+
+  // POST /api/log/edit?id=N  body {vehicle, plate} -> edit metadata 1 entry
+  AsyncCallbackJsonWebHandler* eh = new AsyncCallbackJsonWebHandler("/api/log/edit",
+    [](AsyncWebServerRequest* req, JsonVariant& json) {
+      if (!sd_ok) { req->send(503, "application/json", "{\"ok\":false,\"err\":\"sd_not_ready\"}"); return; }
+      if (!req->hasParam("id")) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"need_id\"}"); return; }
+      int wantId = req->getParam("id")->value().toInt();
+      JsonObject o = json.as<JsonObject>();
+      String vehicle = o["vehicle"] | "";
+      String plate   = o["plate"]   | "";
+      vehicle.trim(); plate.trim();
+      if (vehicle.length() > 40) vehicle = vehicle.substring(0, 40);
+      if (plate.length()   > 20) plate   = plate.substring(0, 20);
+      if (editLogEntry(wantId, vehicle, plate)) {
+        req->send(200, "application/json", "{\"ok\":true}");
+      } else {
+        req->send(404, "application/json", "{\"ok\":false,\"err\":\"id_not_found\"}");
+      }
+    });
+  server.addHandler(eh);
 
   // DELETE /api/logs     -> hapus semua log
   server.on("/api/logs", HTTP_DELETE, [](AsyncWebServerRequest* req){
