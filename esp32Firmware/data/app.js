@@ -114,11 +114,62 @@ function updatePhaseTimeline(state){
 }
 
 // ============ Message handler ============
+// Sinkronisasi state terpusat. Dipanggil dari pesan "state" (one-shot tiap transisi)
+// DAN pesan "data" (periodik 200ms). Karena data membawa snapshot lengkap
+// (state + selected_index + flush), UI bisa self-heal walau frame "state" ter-drop
+// di antrian WebSocket — web tidak akan lagi "stuck" saat ESP32/TFT sudah lanjut.
+function applyServerState(m) {
+  const st = m.state;
+  document.getElementById('valState').textContent = st;
+
+  // Bersihkan chart HANYA saat transisi MASUK ke INHALE (bukan tiap frame).
+  if (st === 'INHALE' && lastServerState !== 'INHALE') clearChart();
+  if (st === 'IDLE') document.getElementById('resultBox').classList.add('hidden');
+
+  // Modal pilih index — buka sekali saat transisi masuk SELECT_IDX
+  if (st === 'SELECT_IDX' && lastServerState !== 'SELECT_IDX') {
+    openIndexModal();
+  } else if (st !== 'SELECT_IDX') {
+    document.getElementById('modalIndex').classList.add('hidden');
+  }
+  // Modal valve — buka sekali saat transisi masuk WAIT_VALVE
+  if (st === 'WAIT_VALVE' && lastServerState !== 'WAIT_VALVE') {
+    document.getElementById('modalValve').classList.remove('hidden');
+  } else if (st !== 'WAIT_VALVE') {
+    document.getElementById('modalValve').classList.add('hidden');
+  }
+
+  // Flush button sync (hanya jika field tersedia)
+  if (typeof m.flush === 'boolean') {
+    flushOn = m.flush;
+    const b = document.getElementById('btnFlush');
+    document.getElementById('flushState').textContent = flushOn?'ON':'OFF';
+    if (flushOn) {
+      b.classList.add('bg-amber-500','text-white','border-amber-500','hover:bg-amber-600');
+      b.classList.remove('bg-white','text-ink-700','hover:bg-ink-50','border-ink-200');
+    } else {
+      b.classList.remove('bg-amber-500','text-white','border-amber-500','hover:bg-amber-600');
+      b.classList.add('bg-white','text-ink-700','hover:bg-ink-50','border-ink-200');
+    }
+  }
+  // Label index terpilih (hanya jika field tersedia)
+  if (m.selected_index !== undefined) {
+    if (m.selected_index >= 0 && settings) {
+      document.getElementById('curIdx').textContent = settings.indices[m.selected_index]?.label || '-';
+    } else {
+      document.getElementById('curIdx').textContent = '-';
+    }
+  }
+
+  updateButtons(st);
+  updatePhaseTimeline(st);
+  lastServerState = st;
+}
+
 function handleMsg(m) {
   if (m.type === 'data') {
     document.getElementById('valHC').textContent = m.hc.toFixed(0);
     document.getElementById('valCO').textContent = m.co.toFixed(2);
-    document.getElementById('valState').textContent = m.state;
     if (m.phase_total > 0) {
       const pct = Math.min(100, (m.elapsed / m.phase_total) * 100);
       document.getElementById('phaseBar').value = pct;
@@ -129,46 +180,10 @@ function handleMsg(m) {
     if (m.state === 'SAMPLING') extra.textContent = `Sample ${m.sampled}/${m.sample_target}`;
     else if (m.phase_total > 0) extra.textContent = `${Math.round(m.elapsed/1000)}s / ${Math.round(m.phase_total/1000)}s`;
     else extra.innerHTML = '&nbsp;';
+    applyServerState(m);   // self-heal sinkronisasi (modal/tombol/timeline)
     if (['INHALE','PREPROCESS','SAMPLING'].includes(m.state)) pushPoint(m.hc, m.co);
-    updateButtons(m.state);
-    updatePhaseTimeline(m.state);
   } else if (m.type === 'state') {
-    document.getElementById('valState').textContent = m.state;
-    if (m.state === 'INHALE') clearChart();
-    if (m.state === 'IDLE') document.getElementById('resultBox').classList.add('hidden');
-    // Sinkron: TFT atau lainnya bisa trigger SELECT_IDX → otomatis buka modal di web
-    if (m.state === 'SELECT_IDX' && lastServerState !== 'SELECT_IDX') {
-      openIndexModal();
-    } else if (m.state !== 'SELECT_IDX') {
-      document.getElementById('modalIndex').classList.add('hidden');
-    }
-    // Modal valve juga sync
-    if (m.state === 'WAIT_VALVE' && lastServerState !== 'WAIT_VALVE') {
-      document.getElementById('modalValve').classList.remove('hidden');
-    } else if (m.state !== 'WAIT_VALVE') {
-      document.getElementById('modalValve').classList.add('hidden');
-    }
-    // Flush button sync
-    if (typeof m.flush === 'boolean') {
-      flushOn = m.flush;
-      const b = document.getElementById('btnFlush');
-      document.getElementById('flushState').textContent = flushOn?'ON':'OFF';
-      if (flushOn) {
-        b.classList.add('bg-amber-500','text-white','border-amber-500','hover:bg-amber-600');
-        b.classList.remove('bg-white','text-ink-700','hover:bg-ink-50','border-ink-200');
-      } else {
-        b.classList.remove('bg-amber-500','text-white','border-amber-500','hover:bg-amber-600');
-        b.classList.add('bg-white','text-ink-700','hover:bg-ink-50','border-ink-200');
-      }
-    }
-    if (m.selected_index !== undefined && m.selected_index >= 0 && settings) {
-      document.getElementById('curIdx').textContent = settings.indices[m.selected_index]?.label || '-';
-    } else {
-      document.getElementById('curIdx').textContent = '-';
-    }
-    lastServerState = m.state;
-    updateButtons(m.state);
-    updatePhaseTimeline(m.state);
+    applyServerState(m);
   } else if (m.type === 'result') {
     showResult(m);
     updateButtons('RESULT');

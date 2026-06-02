@@ -364,6 +364,13 @@ Tidak ada `delay()` di loop. Semua timing pakai `millis()`.
 
 Semua sumber input akhirnya mengubah `state` global. State broadcaster mengirim state baru ke semua client web. TFT loop mendeteksi perubahan state dan redraw layar. Tidak ada duplikasi state — single source of truth.
 
+**Robust terhadap drop-frame (anti "web stuck di IDLE"):**
+ESPAsyncWebServer punya antrian per-client (`WS_MAX_QUEUED_MESSAGES`, default 32 di ESP32). Saat antrian penuh / WiFi lag, frame `state` yang dikirim **sekali** per transisi bisa ter-drop diam-diam → dulu web bisa "tertinggal" sementara ESP32/TFT sudah lanjut. Solusi:
+
+1. Pesan `data` periodik (200ms) kini membawa **snapshot state lengkap** (`state`, `selected_index`, `flush`), bukan hanya angka sensor.
+2. Sisi web menyatukan semua logika sinkron ke `applyServerState(m)` yang dipanggil oleh pesan `state` **dan** `data`. Jadi walau frame `state` ter-drop, frame `data` berikutnya (≤200ms) otomatis menyelaraskan ulang UI (termasuk buka/tutup modal).
+3. `broadcastData()` di-skip saat `ws.availableForWriteAll()` false — frame periodik tidak menyumbat antrian sehingga frame kritis (`state`/`result`) tetap punya ruang dan heap tidak menumpuk.
+
 ---
 
 ## 10. Troubleshooting

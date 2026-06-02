@@ -421,6 +421,11 @@ void wsSend(const String& s) {
 }
 
 void broadcastData() {
+  if (ws.count() == 0) return;
+  // Skip data frame saat antrian client penuh: data bersifat periodik (akan dikirim
+  // ulang 200ms lagi). Membiarkan antrian lega supaya frame KRITIS (state/result)
+  // tidak ikut ter-drop & heap tidak menumpuk.
+  if (!ws.availableForWriteAll()) return;
   JsonDocument d;
   d["type"]    = "data";
   d["hc"]      = lastHC;
@@ -432,6 +437,9 @@ void broadcastData() {
   d["phase_total"] = phaseDuration;
   d["sampled"] = sampledCount;
   d["sample_target"] = cfg.sample_count;
+  // Field state-snapshot agar web bisa self-heal walau frame "state" sempat ter-drop.
+  d["selected_index"] = selectedIndex;
+  d["flush"] = flushManual;
   String s; serializeJson(d, s); wsSend(s);
 }
 void broadcastState() {
@@ -683,7 +691,7 @@ void registerRoutes() {
 
   // POST /api/calibrate -> kalibrasi target idle (HC=1000 ppm, CO=3%)
   server.on("/api/calibrate", HTTP_POST, [](AsyncWebServerRequest* req){
-    if (state != IDLE) {
+    if (state != ST_IDLE) {
       req->send(409, "application/json", "{\"ok\":false,\"err\":\"hanya bisa di state IDLE\"}");
       return;
     }
