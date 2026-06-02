@@ -382,6 +382,34 @@ document.getElementById('btnSave').addEventListener('click', async () => {
   }
 });
 
+document.getElementById('btnCalibrate').addEventListener('click', async () => {
+  const btn = document.getElementById('btnCalibrate');
+  const msg = document.getElementById('calibMsg');
+  if (!confirm('Pastikan motor menyala IDLE STABIL dan sensor sudah preheat ≥5 menit.\n\nLanjutkan kalibrasi?')) return;
+  btn.disabled = true;
+  msg.textContent = 'Mengukur (~3 detik)...';
+  msg.className = 'ml-3 text-xs font-medium text-amber-700';
+  try {
+    const r = await fetch('/api/calibrate', { method: 'POST' });
+    const j = await r.json();
+    if (j.ok) {
+      msg.textContent = `✓ R0 MQ-2=${j.r0_mq2.toFixed(0)}Ω, R0 MQ-7=${j.r0_mq7.toFixed(0)}Ω`;
+      msg.className = 'ml-3 text-xs font-medium text-emerald-700';
+      document.getElementById('r0_mq2').value = j.r0_mq2.toFixed(1);
+      document.getElementById('r0_mq7').value = j.r0_mq7.toFixed(1);
+    } else {
+      msg.textContent = '✗ ' + (j.err || 'gagal');
+      msg.className = 'ml-3 text-xs font-medium text-red-600';
+    }
+  } catch (e) {
+    msg.textContent = '✗ koneksi gagal';
+    msg.className = 'ml-3 text-xs font-medium text-red-600';
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => { msg.textContent = ''; }, 6000);
+  }
+});
+
 // ============ Log (data logger SD) ============
 let logChart = null;
 const RESULT_BADGES = [

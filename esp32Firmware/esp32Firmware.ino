@@ -86,6 +86,11 @@ const char* WIFI_PASS = "12345678";
 #define MQ7_A           99.042f
 #define MQ7_B           -1.518f
 
+// Target kalibrasi idle (mesin nyala stationer): HC=1000 ppm, CO=3% (=30000 ppm)
+#define CALIB_TARGET_HC_PPM   1000.0f
+#define CALIB_TARGET_CO_PPM   30000.0f
+#define CALIB_SAMPLES         20      // 20 sampel x ~150ms ≈ 3 detik
+
 // ---------------- Globals ----------------
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 XPT2046_Touchscreen ts(TOUCH_CS);
@@ -314,6 +319,26 @@ void readSensors() {
   //   yang menandakan pin short ke 3.3V / divider lepas / kabel salah.
   mq2_ok = (lastAdcMQ2 < 4095);
   mq7_ok = (lastAdcMQ7 < 4095);
+}
+
+// ---------------- Kalibrasi target idle ----------------
+// Rata-rata Rs aktual sekarang, lalu hitung R0 yang membuat pembacaan = target.
+// Rumus: R0 = Rs * (target_ppm / a)^(-1/b)
+bool calibrateTargetIdle(float& outR0_mq2, float& outR0_mq7) {
+  float rs2_sum = 0, rs7_sum = 0;
+  for (int i = 0; i < CALIB_SAMPLES; i++) {
+    int a2 = readAdcAvg(PIN_MQ2);
+    int a7 = readAdcAvg(PIN_MQ7);
+    if (a2 >= 4095 || a7 >= 4095) return false;
+    rs2_sum += vmoduleToRs(vadcToVmodule(adcToVadc(a2)));
+    rs7_sum += vmoduleToRs(vadcToVmodule(adcToVadc(a7)));
+    delay(120);
+  }
+  float rs2 = rs2_sum / CALIB_SAMPLES;
+  float rs7 = rs7_sum / CALIB_SAMPLES;
+  outR0_mq2 = rs2 * pow(CALIB_TARGET_HC_PPM / MQ2_A, -1.0f / MQ2_B);
+  outR0_mq7 = rs7 * pow(CALIB_TARGET_CO_PPM / MQ7_A, -1.0f / MQ7_B);
+  return (outR0_mq2 > 0 && outR0_mq7 > 0 && isfinite(outR0_mq2) && isfinite(outR0_mq7));
 }
 
 // ---------------- Settings storage ----------------
@@ -655,6 +680,28 @@ void registerRoutes() {
       req->send(200, "application/json", "{\"ok\":true}");
     });
   server.addHandler(h);
+
+  // POST /api/calibrate -> kalibrasi target idle (HC=1000 ppm, CO=3%)
+  server.on("/api/calibrate", HTTP_POST, [](AsyncWebServerRequest* req){
+    if (state != IDLE) {
+      req->send(409, "application/json", "{\"ok\":false,\"err\":\"hanya bisa di state IDLE\"}");
+      return;
+    }
+    float r0_2 = 0, r0_7 = 0;
+    bool ok = calibrateTargetIdle(r0_2, r0_7);
+    if (!ok) {
+      req->send(500, "application/json", "{\"ok\":false,\"err\":\"sensor disconnect / pembacaan invalid\"}");
+      return;
+    }
+    cfg.r0_mq2 = r0_2;
+    cfg.r0_mq7 = r0_7;
+    saveSettings();
+    char body[160];
+    snprintf(body, sizeof(body),
+      "{\"ok\":true,\"r0_mq2\":%.1f,\"r0_mq7\":%.1f,\"target_hc\":%.0f,\"target_co_pct\":%.2f}",
+      r0_2, r0_7, CALIB_TARGET_HC_PPM, CALIB_TARGET_CO_PPM / 10000.0f);
+    req->send(200, "application/json", body);
+  });
 
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* req){
     JsonDocument d;

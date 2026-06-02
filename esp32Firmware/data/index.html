@@ -347,6 +347,16 @@
           <input type="number" id="r0_mq7" step="any" class="mt-1 w-full px-3 py-2 border border-ink-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500 mono">
         </label>
       </div>
+      <div class="mt-4 p-3 rounded-xl bg-amber-50 border border-amber-200">
+        <p class="text-xs text-amber-800 mb-2">
+          <b>Kalibrasi Otomatis Target Idle:</b> tekan tombol di bawah saat mesin <b>idle stabil</b> (sensor sudah preheat ≥5 menit). Sistem akan mengukur Rs sekarang dan menyetel R0 supaya pembacaan = <b>HC 1000 ppm</b> dan <b>CO 3%</b>.
+        </p>
+        <button id="btnCalibrate" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold transition disabled:opacity-50">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
+          Kalibrasi Idle (HC=1000 / CO=3%)
+        </button>
+        <span id="calibMsg" class="ml-3 text-xs font-medium"></span>
+      </div>
     </div>
 
     <div class="bg-white rounded-2xl shadow-card p-5">
