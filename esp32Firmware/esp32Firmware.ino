@@ -594,13 +594,20 @@ String currentTimestamp() {
 
 // Tulis 1 baris JSONL ke SD; return jumlah byte tertulis (0 = gagal).
 // HANYA dipanggil dari sdTask (sudah pegang ioMutex).
+// VERIFIKASI NYATA: f.print() bisa "sukses" walau kartu membuang data (kartu
+// palsu/rusak) — jadi ukuran file dicek sebelum & sesudah; harus bertambah.
 static size_t writeLogLine(const String& line) {
+  size_t before = 0;
+  { File c = SD.open(LOG_PATH, FILE_READ); if (c) { before = c.size(); c.close(); } }
   File f = SD.open(LOG_PATH, FILE_APPEND);
   if (!f) return 0;
   size_t n = f.print(line);
   if (n > 0) n += f.print('\n');
   f.close();
-  return n;
+  size_t after = 0;
+  { File c = SD.open(LOG_PATH, FILE_READ); if (c) { after = c.size(); c.close(); } }
+  Serial.printf("[LOG] file %u -> %u bytes\n", (unsigned)before, (unsigned)after);
+  return (after > before) ? n : 0;
 }
 
 // Siapkan 1 entry log lalu ANTRIKAN ke sdTask (core 0). Dipanggil dari state
@@ -698,9 +705,14 @@ bool editLogEntry(int wantId, const String& vehicle, const String& plate) {
 // Bangun ulang cache ringkasan log. HANYA dipanggil dari sdTask (sudah pegang
 // ioMutex). GET /api/logs hanya membaca cache RAM ini.
 void rebuildLogsCache() {
-  if (!sd_ok || !SD.exists(LOG_PATH)) { logsCache = "[]"; return; }
+  if (!sd_ok || !SD.exists(LOG_PATH)) {
+    logsCache = "[]";
+    Serial.println("[CACHE] file log tidak ada -> []");
+    return;
+  }
   File f = SD.open(LOG_PATH, FILE_READ);
-  if (!f) { logsCache = "[]"; return; }
+  if (!f) { logsCache = "[]"; Serial.println("[CACHE] open fail -> []"); return; }
+  size_t fsize = f.size();
   JsonDocument outDoc;
   JsonArray arr = outDoc.to<JsonArray>();
   int id = 0;
@@ -729,6 +741,7 @@ void rebuildLogsCache() {
   f.close();
   logsCache = "";
   serializeJson(outDoc, logsCache);
+  Serial.printf("[CACHE] rebuilt: %d entri (file=%u bytes)\n", (int)arr.size(), (unsigned)fsize);
 }
 
 // Worker SD di CORE 0 — satu-satunya penulis SD card. Ambil job dari antrian,
@@ -1019,6 +1032,14 @@ void registerRoutes() {
   // boleh blocking lama di SD. Daftar log dilayani dari cache RAM; operasi SD
   // langsung selalu pakai ioLock timeout pendek + batas waktu loop baca.
 
+  // GET /api/logs/download -> raw JSONL. HARUS didaftarkan SEBELUM "/api/logs":
+  // ESPAsyncWebServer mencocokkan prefix ("/api/logs" menangkap "/api/logs/..."),
+  // jadi kalau terbalik, download dibajak handler daftar (bug shadowing).
+  server.on("/api/logs/download", HTTP_GET, [](AsyncWebServerRequest* req){
+    if (!sd_ok || !SD.exists(LOG_PATH)) { req->send(404, "text/plain", "no logs"); return; }
+    req->send(SD, LOG_PATH, "application/x-ndjson", true);
+  });
+
   // GET /api/logs        -> daftar ringkasan dari CACHE RAM (tanpa sentuh SD)
   server.on("/api/logs", HTTP_GET, [](AsyncWebServerRequest* req){
     if (!sd_ok) { req->send(503, "application/json", "{\"err\":\"sd_not_ready\"}"); return; }
@@ -1092,12 +1113,6 @@ void registerRoutes() {
     SdJob r{SDJOB_REBUILD, nullptr};
     xQueueSend(sdQueue, &r, 0);
     req->send(200, "application/json", "{\"ok\":true}");
-  });
-
-  // GET /api/logs/download -> raw JSONL (untuk download/backup)
-  server.on("/api/logs/download", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (!sd_ok || !SD.exists(LOG_PATH)) { req->send(404, "text/plain", "no logs"); return; }
-    req->send(SD, LOG_PATH, "application/x-ndjson", true);
   });
 
   server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
@@ -1760,7 +1775,23 @@ void setup() {
     uint64_t mb = SD.cardSize() / (1024*1024);
     char sdDetail[24]; snprintf(sdDetail, sizeof(sdDetail), "%llu MB", mb);
     Serial.printf("    SD OK (%llu MB)\n", mb);
-    bootStep(5, "SD Card", 1, sdDetail);
+    // Self-test tulis->baca balik->hapus: kartu palsu/rusak bisa "menerima"
+    // tulisan tapi membuang datanya — ketahuan di sini, bukan saat simpan log.
+    {
+      File t = SD.open("/sdtest.tmp", FILE_WRITE);
+      size_t tn = t ? t.print("OK") : 0;
+      if (t) t.close();
+      File r = SD.open("/sdtest.tmp", FILE_READ);
+      String rb = r ? r.readString() : String("");
+      if (r) r.close();
+      SD.remove("/sdtest.tmp");
+      bool pass = (tn == 2 && rb == "OK");
+      Serial.printf("    SD self-test: write=%u read='%s' -> %s\n",
+                    (unsigned)tn, rb.c_str(),
+                    pass ? "PASS" : "FAIL (kartu tidak menyimpan data! ganti kartu)");
+      if (!pass) sd_ok = false;   // jangan pura-pura sehat: web tampilkan SD bermasalah
+    }
+    bootStep(5, "SD Card", sd_ok ? 1 : 2, sd_ok ? sdDetail : "self-test FAIL");
   } else {
     Serial.println("    SD FAIL");
     bootStep(5, "SD Card", 2, "no card");
