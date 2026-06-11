@@ -192,6 +192,8 @@ function handleMsg(m) {
     if (document.getElementById('tab-log').classList.contains('active')) {
       setTimeout(() => fetchLogs && fetchLogs(), 700);   // beri jeda agar SD selesai menulis
     }
+  } else if (m.type === 'calib_done') {
+    calibDone(m);
   }
 }
 
@@ -397,6 +399,46 @@ document.getElementById('btnSave').addEventListener('click', async () => {
   }
 });
 
+// Kalibrasi non-blocking: POST hanya memicu start di ESP32 (sampling jalan di loop
+// firmware). Hasil datang via WebSocket 'calib_done'; kalau frame ter-drop, ada
+// fallback poll GET /api/calibrate.
+let calibFallbackTimer = null;
+
+function calibDone(j) {
+  const btn = document.getElementById('btnCalibrate');
+  const msg = document.getElementById('calibMsg');
+  if (calibFallbackTimer) { clearTimeout(calibFallbackTimer); calibFallbackTimer = null; }
+  if (j.ok) {
+    msg.textContent = `✓ R0 MQ-2=${j.r0_mq2.toFixed(0)}Ω, R0 MQ-7=${j.r0_mq7.toFixed(0)}Ω (target HC=${j.target_hc} ppm, CO=${j.target_co_pct}%)`;
+    msg.className = 'text-xs font-medium text-emerald-700';
+    document.getElementById('r0_mq2').value = j.r0_mq2.toFixed(1);
+    document.getElementById('r0_mq7').value = j.r0_mq7.toFixed(1);
+  } else {
+    msg.textContent = '✗ ' + (j.err || 'gagal');
+    msg.className = 'text-xs font-medium text-red-600';
+  }
+  btn.disabled = false;
+  setTimeout(() => { msg.textContent = ''; }, 10000);
+}
+
+async function calibPollFallback() {
+  calibFallbackTimer = null;
+  try {
+    const r = await fetch('/api/calibrate');
+    const j = await r.json();
+    if (j.active) {
+      // masih jalan (mis. ESP32 sempat sibuk) -> cek lagi 3 detik
+      calibFallbackTimer = setTimeout(calibPollFallback, 3000);
+    } else if (j.result) {
+      calibDone(j.result);
+    } else {
+      calibDone({ ok: false, err: 'hasil tidak diterima' });
+    }
+  } catch (e) {
+    calibDone({ ok: false, err: 'koneksi gagal' });
+  }
+}
+
 document.getElementById('btnCalibrate').addEventListener('click', async () => {
   const btn = document.getElementById('btnCalibrate');
   const msg = document.getElementById('calibMsg');
@@ -419,21 +461,14 @@ document.getElementById('btnCalibrate').addEventListener('click', async () => {
   try {
     const r = await fetch(`/api/calibrate?hc=${encodeURIComponent(tHc)}&co=${encodeURIComponent(tCo)}`, { method: 'POST' });
     const j = await r.json();
-    if (j.ok) {
-      msg.textContent = `✓ R0 MQ-2=${j.r0_mq2.toFixed(0)}Ω, R0 MQ-7=${j.r0_mq7.toFixed(0)}Ω (target HC=${j.target_hc} ppm, CO=${j.target_co_pct}%)`;
-      msg.className = 'text-xs font-medium text-emerald-700';
-      document.getElementById('r0_mq2').value = j.r0_mq2.toFixed(1);
-      document.getElementById('r0_mq7').value = j.r0_mq7.toFixed(1);
+    if (j.ok && j.started) {
+      // hasil menyusul via WS 'calib_done'; fallback poll kalau frame WS ter-drop
+      calibFallbackTimer = setTimeout(calibPollFallback, (j.duration_ms || 10000) + 4000);
     } else {
-      msg.textContent = '✗ ' + (j.err || 'gagal');
-      msg.className = 'text-xs font-medium text-red-600';
+      calibDone({ ok: false, err: j.err || 'gagal start' });
     }
   } catch (e) {
-    msg.textContent = '✗ koneksi gagal';
-    msg.className = 'text-xs font-medium text-red-600';
-  } finally {
-    btn.disabled = false;
-    setTimeout(() => { msg.textContent = ''; }, 8000);
+    calibDone({ ok: false, err: 'koneksi gagal' });
   }
 });
 

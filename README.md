@@ -255,7 +255,12 @@ Alternatif tanpa hitung manual: tab **Settings → Kalibrasi Otomatis Target Idl
    ```
 4. R0 baru otomatis tersimpan ke NVS dan field R0 di Settings ikut terisi.
 
-API: `POST /api/calibrate?hc=<ppm>&co=<persen>` (hanya di state IDLE; validasi HC 1–50000 ppm, CO 0.01–10 %; tanpa parameter memakai default firmware).
+API:
+- `POST /api/calibrate?hc=<ppm>&co=<persen>` — **memicu start** kalibrasi (hanya di state IDLE; validasi HC 1–50000 ppm, CO 0.01–10 %; tanpa parameter memakai default firmware). Respon instan `{"ok":true,"started":true,"duration_ms":10000}`.
+- Hasil dikirim via WebSocket frame `{"type":"calib_done", ...}`.
+- `GET /api/calibrate` — status & hasil terakhir (fallback poll jika frame WS ter-drop).
+
+> **Catatan desain (penting):** sampling kalibrasi dijalankan **non-blocking di `loop()`** (`calibTick()`), BUKAN di handler HTTP. Handler HTTP jalan di task `async_tcp` yang diawasi task watchdog (timeout 5 detik) — kalibrasi blocking 10 detik di sana memicu `task_wdt: async_tcp` → abort → ESP32 restart.
 
 ### 6.4 Filter Kalman pada Pembacaan Sensor
 
@@ -405,6 +410,7 @@ ESPAsyncWebServer punya antrian per-client (`WS_MAX_QUEUED_MESSAGES`, default 32
 |---|---|---|
 | TFT layar putih / hitam | Pin SPI salah / library tidak match | Cek wiring, pastikan rotation 1, library Adafruit_ILI9341 |
 | TFT putih setelah disentuh | Clash transaksi SPI touch vs TFT (bus dibagi) + clock TFT terlalu tinggi | Sudah di-mitigasi: (1) touch tidak gambar langsung, (2) `TFT_SPI_HZ`=16MHz, (3) touch di-throttle `TOUCH_POLL_MS`=40ms + jeda settle, (4) flush pakai partial redraw. Jika MASIH putih: turunkan `TFT_SPI_HZ` ke `10000000` |
+| Restart `task_wdt: async_tcp` | Handler HTTP blocking >5 detik (task watchdog) | Sudah di-fix: kalibrasi dijalankan non-blocking di `loop()` via `calibTick()`. Jangan pernah `delay()` panjang di handler AsyncWebServer |
 | Touch tidak responsif | T_CS tidak tersambung / kalibrasi salah | Sambungkan T_CS ke GPIO 15. Kalibrasi ulang di `TOUCH_XMIN`..`TOUCH_YMAX` |
 | Touch koordinat meleset | Default calibration tidak match TFT Anda | Print `p.x, p.y` mentah saat tap pojok layar, update define |
 | Tombol ke-tekan berulang / hang saat ditahan | Tanpa edge-detection touch akan retrigger | Sudah di-fix: `getTouch()` pakai edge-detection (1 aksi per tekan, wajib lepas dulu). Atur `TOUCH_DEBOUNCE` / `TOUCH_PRESS_MIN` bila perlu |

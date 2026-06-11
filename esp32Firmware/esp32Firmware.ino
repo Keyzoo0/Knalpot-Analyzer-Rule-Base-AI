@@ -353,26 +353,83 @@ void readSensors() {
   mq7_ok = (lastAdcMQ7 < 4095);
 }
 
-// ---------------- Kalibrasi target idle ----------------
-// Rata-rata Rs aktual sekarang, lalu hitung R0 yang membuat pembacaan = target.
-// Target HC/CO (dalam ppm) dikirim dari web, default CALIB_TARGET_*.
+// ---------------- Kalibrasi target idle (non-blocking) ----------------
+// PENTING: kalibrasi TIDAK boleh blocking di handler HTTP — handler jalan di task
+// async_tcp yang diawasi task watchdog (timeout 5 detik). Blocking 10 detik di sana
+// memicu "task_wdt: async_tcp" -> abort -> restart.
+// Solusi: endpoint hanya memicu start; sampling dicicil di loop() via calibTick();
+// hasil dikirim ke web lewat WebSocket (type=calib_done) + bisa dipoll via GET.
 // Rumus: R0 = Rs * (target_ppm / a)^(-1/b)
-bool calibrateTargetIdle(float targetHcPpm, float targetCoPpm,
-                         float& outR0_mq2, float& outR0_mq7) {
-  float rs2_sum = 0, rs7_sum = 0;
-  for (int i = 0; i < CALIB_SAMPLES; i++) {
-    int a2 = readAdcAvg(PIN_MQ2);
-    int a7 = readAdcAvg(PIN_MQ7);
-    if (a2 >= 4095 || a7 >= 4095) return false;
-    rs2_sum += vmoduleToRs(vadcToVmodule(adcToVadc(a2)));
-    rs7_sum += vmoduleToRs(vadcToVmodule(adcToVadc(a7)));
-    delay(195);   // + ~5ms readAdcAvg x2 -> ~200ms per sampel
+bool     calibActive     = false;
+uint8_t  calibCount      = 0;
+float    calibRs2Sum     = 0, calibRs7Sum = 0;
+float    calibTargetHc   = CALIB_TARGET_HC_PPM;  // ppm
+float    calibTargetCo   = CALIB_TARGET_CO_PPM;  // ppm (% x 10000)
+uint32_t calibLastSample = 0;
+String   calibResultJson = "";                   // hasil terakhir (fallback poll)
+
+void calibStart(float targetHcPpm, float targetCoPpm) {
+  calibTargetHc   = targetHcPpm;
+  calibTargetCo   = targetCoPpm;
+  calibCount      = 0;
+  calibRs2Sum     = 0;
+  calibRs7Sum     = 0;
+  calibLastSample = 0;
+  calibActive     = true;
+  Serial.printf("[CALIB] start target HC=%.0f ppm CO=%.2f %%\n",
+                calibTargetHc, calibTargetCo / 10000.0f);
+}
+
+void calibFinish(bool ok, const char* err, float r0_2, float r0_7) {
+  calibActive = false;
+  JsonDocument d;
+  d["type"] = "calib_done";
+  d["ok"]   = ok;
+  if (ok) {
+    d["r0_mq2"]        = r0_2;
+    d["r0_mq7"]        = r0_7;
+    d["target_hc"]     = calibTargetHc;
+    d["target_co_pct"] = calibTargetCo / 10000.0f;
+  } else {
+    d["err"] = err;
   }
-  float rs2 = rs2_sum / CALIB_SAMPLES;
-  float rs7 = rs7_sum / CALIB_SAMPLES;
-  outR0_mq2 = rs2 * pow(targetHcPpm / MQ2_A, -1.0f / MQ2_B);
-  outR0_mq7 = rs7 * pow(targetCoPpm / MQ7_A, -1.0f / MQ7_B);
-  return (outR0_mq2 > 0 && outR0_mq7 > 0 && isfinite(outR0_mq2) && isfinite(outR0_mq7));
+  calibResultJson = "";
+  serializeJson(d, calibResultJson);
+  wsSend(calibResultJson);
+  Serial.printf("[CALIB] %s r0_mq2=%.1f r0_mq7=%.1f\n", ok ? "OK" : err, r0_2, r0_7);
+}
+
+// Dipanggil dari loop(): ambil 1 sampel tiap 200ms sampai CALIB_SAMPLES.
+void calibTick() {
+  if (!calibActive) return;
+  if (state != ST_IDLE) {           // run dimulai di tengah kalibrasi -> batalkan
+    calibFinish(false, "dibatalkan: system run dimulai", 0, 0);
+    return;
+  }
+  uint32_t now = millis();
+  if (now - calibLastSample < 200) return;
+  calibLastSample = now;
+  int a2 = readAdcAvg(PIN_MQ2);
+  int a7 = readAdcAvg(PIN_MQ7);
+  if (a2 >= 4095 || a7 >= 4095) {
+    calibFinish(false, "sensor disconnect / pembacaan invalid", 0, 0);
+    return;
+  }
+  calibRs2Sum += vmoduleToRs(vadcToVmodule(adcToVadc(a2)));
+  calibRs7Sum += vmoduleToRs(vadcToVmodule(adcToVadc(a7)));
+  if (++calibCount < CALIB_SAMPLES) return;
+  // Semua sampel terkumpul -> back-solve R0 dari target
+  float rs2  = calibRs2Sum / CALIB_SAMPLES;
+  float rs7  = calibRs7Sum / CALIB_SAMPLES;
+  float r0_2 = rs2 * pow(calibTargetHc / MQ2_A, -1.0f / MQ2_B);
+  float r0_7 = rs7 * pow(calibTargetCo / MQ7_A, -1.0f / MQ7_B);
+  bool ok = (r0_2 > 0 && r0_7 > 0 && isfinite(r0_2) && isfinite(r0_7));
+  if (ok) {
+    cfg.r0_mq2 = r0_2;
+    cfg.r0_mq7 = r0_7;
+    saveSettings();
+  }
+  calibFinish(ok, "hasil R0 invalid", r0_2, r0_7);
 }
 
 // ---------------- Settings storage ----------------
@@ -766,11 +823,17 @@ void registerRoutes() {
     });
   server.addHandler(h);
 
-  // POST /api/calibrate?hc=<ppm>&co=<persen> -> kalibrasi target idle dinamis.
+  // POST /api/calibrate?hc=<ppm>&co=<persen> -> MULAI kalibrasi target idle dinamis.
+  // Non-blocking: hanya memicu start (sampling dicicil di loop), respon instan.
+  // Hasil dikirim via WebSocket type=calib_done; fallback: GET /api/calibrate.
   // Tanpa parameter: pakai default CALIB_TARGET_HC_PPM / CALIB_TARGET_CO_PPM.
   server.on("/api/calibrate", HTTP_POST, [](AsyncWebServerRequest* req){
     if (state != ST_IDLE) {
       req->send(409, "application/json", "{\"ok\":false,\"err\":\"hanya bisa di state IDLE\"}");
+      return;
+    }
+    if (calibActive) {
+      req->send(409, "application/json", "{\"ok\":false,\"err\":\"kalibrasi sedang berjalan\"}");
       return;
     }
     float targetHc = CALIB_TARGET_HC_PPM;            // ppm
@@ -783,20 +846,22 @@ void registerRoutes() {
         "{\"ok\":false,\"err\":\"target invalid (HC 1-50000 ppm, CO 0.01-10 %)\"}");
       return;
     }
-    float r0_2 = 0, r0_7 = 0;
-    bool ok = calibrateTargetIdle(targetHc, targetCo, r0_2, r0_7);
-    if (!ok) {
-      req->send(500, "application/json", "{\"ok\":false,\"err\":\"sensor disconnect / pembacaan invalid\"}");
-      return;
-    }
-    cfg.r0_mq2 = r0_2;
-    cfg.r0_mq7 = r0_7;
-    saveSettings();
-    char body[160];
+    calibStart(targetHc, targetCo);
+    char body[96];
     snprintf(body, sizeof(body),
-      "{\"ok\":true,\"r0_mq2\":%.1f,\"r0_mq7\":%.1f,\"target_hc\":%.0f,\"target_co_pct\":%.2f}",
-      r0_2, r0_7, targetHc, targetCo / 10000.0f);
+      "{\"ok\":true,\"started\":true,\"duration_ms\":%u}",
+      (unsigned)(CALIB_SAMPLES * 200u));
     req->send(200, "application/json", body);
+  });
+
+  // GET /api/calibrate -> status & hasil terakhir (fallback jika frame WS ter-drop)
+  server.on("/api/calibrate", HTTP_GET, [](AsyncWebServerRequest* req){
+    String s = "{\"active\":";
+    s += calibActive ? "true" : "false";
+    s += ",\"result\":";
+    s += calibResultJson.length() ? calibResultJson : "null";
+    s += "}";
+    req->send(200, "application/json", s);
   });
 
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* req){
@@ -1642,6 +1707,7 @@ void loop() {
       chartPush(lastHC, lastCO);
     }
   }
+  calibTick();   // kalibrasi non-blocking (no-op jika tidak aktif)
   // dispatch touch (di-throttle: kurangi kerapatan transaksi SPI touch vs TFT)
   static uint32_t lastTouchPoll = 0;
   if (now - lastTouchPoll >= TOUCH_POLL_MS) {
