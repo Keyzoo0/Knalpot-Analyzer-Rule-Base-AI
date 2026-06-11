@@ -705,7 +705,8 @@ bool editLogEntry(int wantId, const String& vehicle, const String& plate) {
 // Bangun ulang cache ringkasan log. HANYA dipanggil dari sdTask (sudah pegang
 // ioMutex). GET /api/logs hanya membaca cache RAM ini.
 void rebuildLogsCache() {
-  if (!sd_ok || !SD.exists(LOG_PATH)) {
+  if (!sd_ok) return;   // breaker aktif: biarkan cache lama tetap tampil
+  if (!SD.exists(LOG_PATH)) {
     logsCache = "[]";
     Serial.println("[CACHE] file log tidak ada -> []");
     return;
@@ -737,6 +738,7 @@ void rebuildLogsCache() {
     o["label"]  = d["label"].as<String>();
     o["n"]      = d["n"].as<int>();
     id++;
+    if ((id & 0x07) == 0) vTaskDelay(1);   // napas utk IDLE0 tiap 8 baris (anti task_wdt)
   }
   f.close();
   logsCache = "";
@@ -753,18 +755,24 @@ void sdTaskLoop(void*) {
     if (xQueueReceive(sdQueue, &job, portMAX_DELAY) != pdTRUE) continue;
     if (job.type == SDJOB_SAVE) {
       bool ok = false;
+      bool attempted = false;
       size_t n = 0;
       if (ioLock(8000)) {
+        attempted = true;
         n = writeLogLine(*job.payload);
         if (n == 0) {
+          // Yield antar langkah: kartu sekarat membuat driver SD busy-spin lama.
+          // sdTask prio 1 > IDLE0 prio 0 -> tanpa jeda, IDLE0 (core 0) kelaparan
+          // >5 detik -> task_wdt -> restart. vTaskDelay memberi IDLE0 napas.
+          vTaskDelay(pdMS_TO_TICKS(20));
           Serial.println("[LOG] write fail -> remount SD & retry...");
           SD.end();
-          delay(50);
+          vTaskDelay(pdMS_TO_TICKS(50));
           if (SD.begin(SD_CS, SPI, 4000000)) {
+            vTaskDelay(pdMS_TO_TICKS(20));
             n = writeLogLine(*job.payload);
           } else {
             Serial.println("[LOG] remount fail");
-            sd_ok = false;   // tandai agar terlihat di /api/status & web
           }
         }
         ok = (n > 0);
@@ -773,13 +781,24 @@ void sdTaskLoop(void*) {
         Serial.println("[LOG] SAVE FAIL: ioMutex timeout");
       }
       delete job.payload;
+      if (!ok && attempted && sd_ok) {
+        // Circuit breaker: tulis terverifikasi gagal walau sudah remount+retry ->
+        // kartu memang tidak bisa dipakai. Matikan SD sampai restart supaya tiap
+        // operasi lambat tidak terus membebani bus & memancing WDT.
+        sd_ok = false;
+        Serial.println("[LOG] SD dinonaktifkan sampai restart (tulis gagal terverifikasi)");
+      }
       logSaveState = ok ? 1 : 0;
       logSaveNotify = true;
       Serial.printf("[LOG] %s (%u bytes)\n", ok ? "saved" : "SAVE FAIL", (unsigned)n);
-      SdJob r{SDJOB_REBUILD, nullptr};
-      xQueueSend(sdQueue, &r, 0);   // refresh cache daftar log
+      if (ok) {
+        SdJob r{SDJOB_REBUILD, nullptr};
+        xQueueSend(sdQueue, &r, 0);   // refresh cache daftar log
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
     } else if (job.type == SDJOB_REBUILD) {
       if (ioLock(8000)) { rebuildLogsCache(); ioUnlock(); }
+      vTaskDelay(pdMS_TO_TICKS(10));
     }
   }
 }
@@ -1781,9 +1800,11 @@ void setup() {
       File t = SD.open("/sdtest.tmp", FILE_WRITE);
       size_t tn = t ? t.print("OK") : 0;
       if (t) t.close();
+      delay(10);
       File r = SD.open("/sdtest.tmp", FILE_READ);
       String rb = r ? r.readString() : String("");
       if (r) r.close();
+      delay(10);
       SD.remove("/sdtest.tmp");
       bool pass = (tn == 2 && rb == "OK");
       Serial.printf("    SD self-test: write=%u read='%s' -> %s\n",
