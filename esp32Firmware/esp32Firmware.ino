@@ -87,9 +87,9 @@ const char* WIFI_PASS = "12345678";
 #define MQ7_A           99.042f
 #define MQ7_B           -1.518f
 
-// Target kalibrasi idle (mesin nyala stationer): HC=1000 ppm, CO=3% (=30000 ppm)
-#define CALIB_TARGET_HC_PPM   1000.0f
-#define CALIB_TARGET_CO_PPM   30000.0f
+// Target kalibrasi idle default (bisa diubah dari web): HC=75 ppm, CO=0.29% (=2900 ppm)
+#define CALIB_TARGET_HC_PPM   75.0f
+#define CALIB_TARGET_CO_PPM   2900.0f
 #define CALIB_SAMPLES         20      // 20 sampel x ~150ms ≈ 3 detik
 
 // ---------------- Globals ----------------
@@ -325,8 +325,10 @@ void readSensors() {
 
 // ---------------- Kalibrasi target idle ----------------
 // Rata-rata Rs aktual sekarang, lalu hitung R0 yang membuat pembacaan = target.
+// Target HC/CO (dalam ppm) dikirim dari web, default CALIB_TARGET_*.
 // Rumus: R0 = Rs * (target_ppm / a)^(-1/b)
-bool calibrateTargetIdle(float& outR0_mq2, float& outR0_mq7) {
+bool calibrateTargetIdle(float targetHcPpm, float targetCoPpm,
+                         float& outR0_mq2, float& outR0_mq7) {
   float rs2_sum = 0, rs7_sum = 0;
   for (int i = 0; i < CALIB_SAMPLES; i++) {
     int a2 = readAdcAvg(PIN_MQ2);
@@ -338,8 +340,8 @@ bool calibrateTargetIdle(float& outR0_mq2, float& outR0_mq7) {
   }
   float rs2 = rs2_sum / CALIB_SAMPLES;
   float rs7 = rs7_sum / CALIB_SAMPLES;
-  outR0_mq2 = rs2 * pow(CALIB_TARGET_HC_PPM / MQ2_A, -1.0f / MQ2_B);
-  outR0_mq7 = rs7 * pow(CALIB_TARGET_CO_PPM / MQ7_A, -1.0f / MQ7_B);
+  outR0_mq2 = rs2 * pow(targetHcPpm / MQ2_A, -1.0f / MQ2_B);
+  outR0_mq7 = rs7 * pow(targetCoPpm / MQ7_A, -1.0f / MQ7_B);
   return (outR0_mq2 > 0 && outR0_mq7 > 0 && isfinite(outR0_mq2) && isfinite(outR0_mq7));
 }
 
@@ -734,14 +736,25 @@ void registerRoutes() {
     });
   server.addHandler(h);
 
-  // POST /api/calibrate -> kalibrasi target idle (HC=1000 ppm, CO=3%)
+  // POST /api/calibrate?hc=<ppm>&co=<persen> -> kalibrasi target idle dinamis.
+  // Tanpa parameter: pakai default CALIB_TARGET_HC_PPM / CALIB_TARGET_CO_PPM.
   server.on("/api/calibrate", HTTP_POST, [](AsyncWebServerRequest* req){
     if (state != ST_IDLE) {
       req->send(409, "application/json", "{\"ok\":false,\"err\":\"hanya bisa di state IDLE\"}");
       return;
     }
+    float targetHc = CALIB_TARGET_HC_PPM;            // ppm
+    float targetCo = CALIB_TARGET_CO_PPM;            // ppm (dari % x 10000)
+    if (req->hasParam("hc")) targetHc = req->getParam("hc")->value().toFloat();
+    if (req->hasParam("co")) targetCo = req->getParam("co")->value().toFloat() * 10000.0f;
+    if (!(targetHc >= 1.0f && targetHc <= 50000.0f) ||
+        !(targetCo >= 100.0f && targetCo <= 100000.0f)) {
+      req->send(400, "application/json",
+        "{\"ok\":false,\"err\":\"target invalid (HC 1-50000 ppm, CO 0.01-10 %)\"}");
+      return;
+    }
     float r0_2 = 0, r0_7 = 0;
-    bool ok = calibrateTargetIdle(r0_2, r0_7);
+    bool ok = calibrateTargetIdle(targetHc, targetCo, r0_2, r0_7);
     if (!ok) {
       req->send(500, "application/json", "{\"ok\":false,\"err\":\"sensor disconnect / pembacaan invalid\"}");
       return;
@@ -752,7 +765,7 @@ void registerRoutes() {
     char body[160];
     snprintf(body, sizeof(body),
       "{\"ok\":true,\"r0_mq2\":%.1f,\"r0_mq7\":%.1f,\"target_hc\":%.0f,\"target_co_pct\":%.2f}",
-      r0_2, r0_7, CALIB_TARGET_HC_PPM, CALIB_TARGET_CO_PPM / 10000.0f);
+      r0_2, r0_7, targetHc, targetCo / 10000.0f);
     req->send(200, "application/json", body);
   });
 

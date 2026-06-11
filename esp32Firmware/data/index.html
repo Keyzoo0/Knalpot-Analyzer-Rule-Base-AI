@@ -349,13 +349,25 @@
       </div>
       <div class="mt-4 p-3 rounded-xl bg-amber-50 border border-amber-200">
         <p class="text-xs text-amber-800 mb-2">
-          <b>Kalibrasi Otomatis Target Idle:</b> tekan tombol di bawah saat mesin <b>idle stabil</b> (sensor sudah preheat ≥5 menit). Sistem akan mengukur Rs sekarang dan menyetel R0 supaya pembacaan = <b>HC 1000 ppm</b> dan <b>CO 3%</b>.
+          <b>Kalibrasi Otomatis Target Idle:</b> isi target pembacaan saat mesin <b>idle stabil</b> (sensor sudah preheat ≥5 menit), lalu tekan tombol. Sistem akan mengukur Rs sekarang dan menyetel R0 supaya pembacaan sensor = target yang diisi.
         </p>
-        <button id="btnCalibrate" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold transition disabled:opacity-50">
-          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
-          Kalibrasi Idle (HC=1000 / CO=3%)
-        </button>
-        <span id="calibMsg" class="ml-3 text-xs font-medium"></span>
+        <div class="flex flex-wrap items-end gap-3 mb-2">
+          <label class="block">
+            <span class="text-[11px] font-medium text-amber-800">Target HC (ppm)</span>
+            <input id="calibTargetHc" type="number" min="1" max="50000" step="1" value="75"
+                   class="mt-0.5 w-28 px-2 py-1.5 rounded-lg border border-amber-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-amber-400">
+          </label>
+          <label class="block">
+            <span class="text-[11px] font-medium text-amber-800">Target CO (%)</span>
+            <input id="calibTargetCo" type="number" min="0.01" max="10" step="0.01" value="0.29"
+                   class="mt-0.5 w-28 px-2 py-1.5 rounded-lg border border-amber-300 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-amber-400">
+          </label>
+          <button id="btnCalibrate" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold transition disabled:opacity-50">
+            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
+            Mulai Kalibrasi
+          </button>
+        </div>
+        <span id="calibMsg" class="text-xs font-medium"></span>
       </div>
     </div>
 

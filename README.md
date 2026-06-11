@@ -243,6 +243,20 @@ Menampilkan:
    - **MQ-7** clean air: Rs/R0 ≈ 27.5 → **R0 = Rs / 27.5**
 6. Masukkan nilai R0 di tab Settings → Simpan.
 
+### 6.3 Kalibrasi Otomatis Target Idle (dinamis)
+
+Alternatif tanpa hitung manual: tab **Settings → Kalibrasi Otomatis Target Idle**.
+
+1. Nyalakan mesin sampai **idle stabil**, sensor sudah preheat ≥5 menit.
+2. Isi **Target HC (ppm)** dan **Target CO (%)** — nilai pembacaan yang diinginkan untuk kondisi idle saat ini (default HC=75 ppm, CO=0.29%).
+3. Tekan **Mulai Kalibrasi**. ESP32 merata-rata Rs selama ~3 detik (20 sampel), lalu back-solve R0 dari curve datasheet:
+   ```
+   R0 = Rs × (target_ppm / a)^(-1/b)
+   ```
+4. R0 baru otomatis tersimpan ke NVS dan field R0 di Settings ikut terisi.
+
+API: `POST /api/calibrate?hc=<ppm>&co=<persen>` (hanya di state IDLE; validasi HC 1–50000 ppm, CO 0.01–10 %; tanpa parameter memakai default firmware).
+
 ---
 
 ## 7. State Machine & Rule Based AI
