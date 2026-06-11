@@ -255,6 +255,31 @@ void handleBuzzer() {
 
 // ---------------- Sensor reading (MQ-2 & MQ-7) ----------------
 
+// Filter Kalman 1D (scalar) untuk menghaluskan pembacaan ADC MQ.
+// q = process noise (semakin besar = respon cepat, smoothing kurang)
+// r = measurement noise (semakin besar = smoothing kuat, respon lambat)
+// Dengan polling 200ms, q=1/r=30 memberi lag efektif ~5 sampel (~1 detik).
+#define KF_Q  1.0f
+#define KF_R  30.0f
+
+struct Kalman1D {
+  float q, r;        // kovarians noise proses & pengukuran
+  float p = 1.0f;    // kovarians estimasi
+  float x = 0.0f;    // estimasi state
+  bool  init = false;
+  float update(float z) {
+    if (!init) { x = z; init = true; return x; }   // seed dengan sampel pertama
+    p += q;
+    float k = p / (p + r);   // Kalman gain
+    x += k * (z - x);
+    p *= (1.0f - k);
+    return x;
+  }
+};
+
+Kalman1D kfMQ2{KF_Q, KF_R};
+Kalman1D kfMQ7{KF_Q, KF_R};
+
 // 1) Baca ADC mentah, sudah di-rata-rata
 int readAdcAvg(int pin) {
   long sum = 0;
@@ -266,8 +291,9 @@ int readAdcAvg(int pin) {
 }
 
 // 2) ADC mentah -> tegangan di kaki ADC (0..3.3V)
-float adcToVadc(int adc) {
-  return ((float)adc / (float)ADC_MAX) * ADC_VREF;
+//    Param float agar bisa menerima nilai ADC hasil filter Kalman.
+float adcToVadc(float adc) {
+  return (adc / (float)ADC_MAX) * ADC_VREF;
 }
 
 // 3) Tegangan ADC -> tegangan asli Vout modul MQ (sebelum pembagi tegangan)
@@ -292,9 +318,12 @@ float ratioToPpm(float rs, float r0, float a, float b) {
 }
 
 // Baca MQ-2 -> HC ppm
+// ADC mentah tetap disimpan di lastAdcMQ2 untuk health check (deteksi rail 4095);
+// konversi ppm memakai nilai ADC yang sudah dihaluskan filter Kalman.
 float readMQ2_HC() {
   lastAdcMQ2   = readAdcAvg(PIN_MQ2);
-  float vadc   = adcToVadc(lastAdcMQ2);
+  float adcF   = kfMQ2.update((float)lastAdcMQ2);
+  float vadc   = adcToVadc(adcF);
   float vmod   = vadcToVmodule(vadc);
   float rs     = vmoduleToRs(vmod);
   return ratioToPpm(rs, cfg.r0_mq2, MQ2_A, MQ2_B);
@@ -303,7 +332,8 @@ float readMQ2_HC() {
 // Baca MQ-7 -> CO % (datasheet pakai ppm; 1% volume = 10000 ppm)
 float readMQ7_CO() {
   lastAdcMQ7   = readAdcAvg(PIN_MQ7);
-  float vadc   = adcToVadc(lastAdcMQ7);
+  float adcF   = kfMQ7.update((float)lastAdcMQ7);
+  float vadc   = adcToVadc(adcF);
   float vmod   = vadcToVmodule(vadc);
   float rs     = vmoduleToRs(vmod);
   float ppm    = ratioToPpm(rs, cfg.r0_mq7, MQ7_A, MQ7_B);

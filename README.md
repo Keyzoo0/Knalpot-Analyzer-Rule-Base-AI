@@ -257,6 +257,18 @@ Alternatif tanpa hitung manual: tab **Settings → Kalibrasi Otomatis Target Idl
 
 API: `POST /api/calibrate?hc=<ppm>&co=<persen>` (hanya di state IDLE; validasi HC 1–50000 ppm, CO 0.01–10 %; tanpa parameter memakai default firmware).
 
+### 6.4 Filter Kalman pada Pembacaan Sensor
+
+Pipeline pembacaan tiap 200ms:
+
+```
+ADC (avg 16 sampel) → Filter Kalman 1D → Vadc → Vmodule → Rs → ppm/%
+```
+
+- Filter Kalman scalar (`q=1`, `r=30`) diterapkan pada nilai ADC **sebelum** konversi ke tegangan/Rs/ppm — menghaluskan noise pembacaan dengan lag efektif ~5 sampel (~1 detik).
+- ADC **mentah** tetap dipakai untuk health check sensor (deteksi rail 4095 / disconnect), supaya deteksi fault tidak tertunda filter.
+- Tuning di firmware: `KF_Q` (besar = respon cepat) dan `KF_R` (besar = smoothing kuat).
+
 ---
 
 ## 7. State Machine & Rule Based AI
