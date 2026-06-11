@@ -506,6 +506,13 @@ async function fetchLogs(){
   try {
     const r = await fetch('/api/logs');
     if (r.status === 503) {
+      let err = '';
+      try { err = (await r.json()).err || ''; } catch (_) {}
+      if (err === 'busy') {
+        // SD sedang dipakai task lain (transient) — auto-refresh akan retry
+        document.getElementById('logCount').textContent = '— sibuk, mencoba lagi...';
+        return;
+      }
       document.getElementById('logSdWarn').classList.remove('hidden');
       body.innerHTML = '';
       document.getElementById('logCount').textContent = '— SD tidak aktif';

@@ -180,6 +180,20 @@ bool lastLogSaved = false;              // status simpan log terakhir (dikirim d
 const char* LOG_PATH = "/logs.jsonl";   // JSON-lines: 1 baris = 1 log entry
 const char* LOG_TMP  = "/logs.tmp";     // file sementara saat rewrite (edit entry)
 
+// --- Proteksi akses SD antar task ---
+// Handler HTTP jalan di task async_tcp (diawasi task watchdog 5 detik). Kartu SD
+// yang "wedged" membuat tiap operasi SPI timeout berulang -> handler macet >5s ->
+// task_wdt -> restart. Apalagi tab Log web auto-refresh 3 detik = restart loop.
+// Aturan: async_tcp TIDAK boleh baca SD di jalur panas. GET /api/logs dilayani
+// dari cache RAM (dibangun di loopTask). Operasi SD lain diserialisasi sdMutex
+// dengan timeout pendek + batas waktu loop baca, supaya tidak pernah kena WDT.
+SemaphoreHandle_t sdMutex = nullptr;
+String logsCache = "[]";                // cache ringkasan log utk GET /api/logs
+volatile bool logsDirty = true;         // minta rebuild cache di loop()
+
+bool sdLock(uint32_t ms) { return sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(ms)) == pdTRUE; }
+void sdUnlock()          { if (sdMutex) xSemaphoreGive(sdMutex); }
+
 // Latest readings
 float lastHC = 0, lastCO = 0;
 int   lastAdcMQ2 = 0, lastAdcMQ7 = 0;
@@ -610,6 +624,10 @@ void saveLogEntry() {
     coArr.add(sampleCO[i]);
   }
 
+  if (!sdLock(3000)) {
+    Serial.println("[LOG] SAVE FAIL: SD busy (mutex timeout)");
+    return;
+  }
   size_t n = writeLogLine(d);
   if (n == 0) {
     Serial.println("[LOG] write fail -> remount SD & retry...");
@@ -626,6 +644,8 @@ void saveLogEntry() {
   size_t fsize = 0;
   File chk = SD.open(LOG_PATH, FILE_READ);
   if (chk) { fsize = chk.size(); chk.close(); }
+  sdUnlock();
+  logsDirty = true;   // rebuild cache daftar log di loop()
   Serial.printf("[LOG] %s (%u bytes, file=%u bytes)\n",
                 lastLogSaved ? "saved" : "SAVE FAIL", (unsigned)n, (unsigned)fsize);
 }
@@ -643,7 +663,15 @@ bool editLogEntry(int wantId, const String& vehicle, const String& plate) {
 
   int id = 0;
   bool edited = false;
+  uint32_t t0 = millis();
   while (in.available()) {
+    // Batas waktu: dipanggil dari task async_tcp (WDT 5 detik). Kartu SD wedged
+    // membuat tiap baca timeout — lebih baik gagal daripada restart.
+    if (millis() - t0 > 3000) {
+      in.close(); out.close(); SD.remove(LOG_TMP);
+      Serial.println("[LOG] edit timeout (SD lambat)");
+      return false;
+    }
     String line = in.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
@@ -668,6 +696,46 @@ bool editLogEntry(int wantId, const String& vehicle, const String& plate) {
   if (!edited) { SD.remove(LOG_TMP); return false; }
   SD.remove(LOG_PATH);
   return SD.rename(LOG_TMP, LOG_PATH);
+}
+
+// Bangun ulang cache ringkasan log (dipanggil dari loop() saat logsDirty).
+// GET /api/logs hanya membaca cache RAM ini — task async_tcp bebas dari SD.
+// Return true jika cache valid (logsDirty boleh di-clear).
+bool rebuildLogsCache() {
+  if (!sd_ok || !SD.exists(LOG_PATH)) {
+    if (sdLock(100)) { logsCache = "[]"; sdUnlock(); return true; }
+    return false;
+  }
+  if (!sdLock(2000)) return false;   // SD sibuk -> coba lagi tick berikutnya
+  File f = SD.open(LOG_PATH, FILE_READ);
+  if (!f) { logsCache = "[]"; sdUnlock(); return true; }
+  JsonDocument outDoc;
+  JsonArray arr = outDoc.to<JsonArray>();
+  int id = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    JsonDocument d;
+    if (deserializeJson(d, line)) { id++; continue; }
+    JsonObject o = arr.add<JsonObject>();
+    o["id"]      = id;
+    o["ts"]      = d["ts"].as<String>();
+    o["vehicle"] = d["vehicle"] | "";   // entry lama tanpa field -> string kosong
+    o["plate"]   = d["plate"]   | "";
+    o["idx"]    = d["idx_label"].as<String>();
+    o["avg_hc"] = d["avg_hc"].as<float>();
+    o["avg_co"] = d["avg_co"].as<float>();
+    o["code"]   = d["code"].as<int>();
+    o["label"]  = d["label"].as<String>();
+    o["n"]      = d["n"].as<int>();
+    id++;
+  }
+  f.close();
+  logsCache = "";
+  serializeJson(outDoc, logsCache);
+  sdUnlock();
+  return true;
 }
 
 // ---------------- State machine transitions ----------------
@@ -914,37 +982,16 @@ void registerRoutes() {
   });
 
   // === LOG endpoints (SD card) ===
-  // GET /api/logs        -> daftar ringkasan (tanpa array sample) untuk tabel
+  // ATURAN: handler ini jalan di task async_tcp (task watchdog 5 detik) — tidak
+  // boleh blocking lama di SD. Daftar log dilayani dari cache RAM; operasi SD
+  // langsung selalu pakai sdLock timeout pendek + batas waktu loop baca.
+
+  // GET /api/logs        -> daftar ringkasan dari CACHE RAM (tanpa sentuh SD)
   server.on("/api/logs", HTTP_GET, [](AsyncWebServerRequest* req){
     if (!sd_ok) { req->send(503, "application/json", "{\"err\":\"sd_not_ready\"}"); return; }
-    if (!SD.exists(LOG_PATH)) { req->send(200, "application/json", "[]"); return; }
-    File f = SD.open(LOG_PATH, FILE_READ);
-    if (!f) { req->send(500, "application/json", "{\"err\":\"open_fail\"}"); return; }
-    JsonDocument outDoc;
-    JsonArray arr = outDoc.to<JsonArray>();
-    int id = 0;
-    while (f.available()) {
-      String line = f.readStringUntil('\n');
-      line.trim();
-      if (line.length() == 0) continue;
-      JsonDocument d;
-      if (deserializeJson(d, line)) { id++; continue; }
-      JsonObject o = arr.add<JsonObject>();
-      o["id"]      = id;
-      o["ts"]      = d["ts"].as<String>();
-      o["vehicle"] = d["vehicle"] | "";   // entry lama tanpa field -> string kosong
-      o["plate"]   = d["plate"]   | "";
-      o["idx"]    = d["idx_label"].as<String>();
-      o["avg_hc"] = d["avg_hc"].as<float>();
-      o["avg_co"] = d["avg_co"].as<float>();
-      o["code"]   = d["code"].as<int>();
-      o["label"]  = d["label"].as<String>();
-      o["n"]      = d["n"].as<int>();
-      id++;
-    }
-    f.close();
-    String out;
-    serializeJson(outDoc, out);
+    if (!sdLock(100)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
+    String out = logsCache;   // copy singkat di dalam lock (hindari race dgn rebuild)
+    sdUnlock();
     req->send(200, "application/json", out);
   });
 
@@ -953,21 +1000,28 @@ void registerRoutes() {
     if (!sd_ok) { req->send(503, "application/json", "{\"err\":\"sd_not_ready\"}"); return; }
     if (!req->hasParam("id")) { req->send(400, "application/json", "{\"err\":\"need_id\"}"); return; }
     int wantId = req->getParam("id")->value().toInt();
+    if (!sdLock(250)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
     File f = SD.open(LOG_PATH, FILE_READ);
-    if (!f) { req->send(404, "application/json", "{\"err\":\"no_log\"}"); return; }
+    if (!f) { sdUnlock(); req->send(404, "application/json", "{\"err\":\"no_log\"}"); return; }
     int id = 0;
+    uint32_t t0 = millis();
     while (f.available()) {
+      if (millis() - t0 > 3000) {   // SD lambat/wedged: gagal sebelum kena WDT
+        f.close(); sdUnlock();
+        req->send(504, "application/json", "{\"err\":\"sd_timeout\"}");
+        return;
+      }
       String line = f.readStringUntil('\n');
       line.trim();
       if (line.length() == 0) continue;
       if (id == wantId) {
-        f.close();
+        f.close(); sdUnlock();
         req->send(200, "application/json", line);
         return;
       }
       id++;
     }
-    f.close();
+    f.close(); sdUnlock();
     req->send(404, "application/json", "{\"err\":\"id_not_found\"}");
   });
 
@@ -983,7 +1037,11 @@ void registerRoutes() {
       vehicle.trim(); plate.trim();
       if (vehicle.length() > 40) vehicle = vehicle.substring(0, 40);
       if (plate.length()   > 20) plate   = plate.substring(0, 20);
-      if (editLogEntry(wantId, vehicle, plate)) {
+      if (!sdLock(250)) { req->send(503, "application/json", "{\"ok\":false,\"err\":\"busy\"}"); return; }
+      bool ok = editLogEntry(wantId, vehicle, plate);
+      sdUnlock();
+      if (ok) {
+        logsDirty = true;   // refresh cache daftar log
         req->send(200, "application/json", "{\"ok\":true}");
       } else {
         req->send(404, "application/json", "{\"ok\":false,\"err\":\"id_not_found\"}");
@@ -994,7 +1052,10 @@ void registerRoutes() {
   // DELETE /api/logs     -> hapus semua log
   server.on("/api/logs", HTTP_DELETE, [](AsyncWebServerRequest* req){
     if (!sd_ok) { req->send(503, "application/json", "{\"err\":\"sd_not_ready\"}"); return; }
+    if (!sdLock(250)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
     if (SD.exists(LOG_PATH)) SD.remove(LOG_PATH);
+    sdUnlock();
+    logsDirty = true;
     req->send(200, "application/json", "{\"ok\":true}");
   });
 
@@ -1645,6 +1706,7 @@ void setup() {
   bootStep(4, "Settings", 1, detail);
 
   // --- SD Card ---
+  sdMutex = xSemaphoreCreateMutex();   // serialisasi akses SD loopTask vs async_tcp
   Serial.println("    SD.begin...");
   // SD share SPI dengan TFT/touch. Pastikan slave lain deselect, lalu coba beberapa frekuensi.
   digitalWrite(TFT_CS,   HIGH);
@@ -1737,6 +1799,8 @@ void loop() {
     }
   }
   calibTick();   // kalibrasi non-blocking (no-op jika tidak aktif)
+  // Rebuild cache daftar log di loopTask (async_tcp hanya baca cache RAM)
+  if (logsDirty && rebuildLogsCache()) logsDirty = false;
   // dispatch touch (di-throttle: kurangi kerapatan transaksi SPI touch vs TFT)
   static uint32_t lastTouchPoll = 0;
   if (now - lastTouchPoll >= TOUCH_POLL_MS) {
