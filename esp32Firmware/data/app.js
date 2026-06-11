@@ -249,6 +249,23 @@ function showResult(m){
   document.getElementById('resThHC').textContent = m.th_hc;
   document.getElementById('resThCO').textContent = m.th_co;
   document.getElementById('resIdx').textContent = m.index_label;
+  // status simpan log SD (field log_saved dari firmware; undefined = firmware lama)
+  let saveNote = document.getElementById('resLogSaved');
+  if (!saveNote) {
+    saveNote = document.createElement('div');
+    saveNote.id = 'resLogSaved';
+    saveNote.className = 'mt-2 text-xs font-medium';
+    hero.appendChild(saveNote);
+  }
+  if (m.log_saved === true) {
+    saveNote.textContent = '✓ Tersimpan di data log (SD card)';
+    saveNote.style.color = 'rgba(255,255,255,0.9)';
+  } else if (m.log_saved === false) {
+    saveNote.textContent = '✗ GAGAL simpan ke SD card — cek kartu SD!';
+    saveNote.style.color = '#fde047';
+  } else {
+    saveNote.textContent = '';
+  }
   // re-trigger animation
   box.classList.remove('reveal'); void box.offsetWidth; box.classList.add('reveal');
 }

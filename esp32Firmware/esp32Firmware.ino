@@ -176,6 +176,7 @@ float    sampleCO[MAX_SAMPLES];
 
 // SD card
 bool sd_ok = false;
+bool lastLogSaved = false;              // status simpan log terakhir (dikirim di frame result)
 const char* LOG_PATH = "/logs.jsonl";   // JSON-lines: 1 baris = 1 log entry
 const char* LOG_TMP  = "/logs.tmp";     // file sementara saat rewrite (edit entry)
 
@@ -553,6 +554,7 @@ void broadcastResult() {
   d["th_hc"]  = (selectedIndex>=0)?cfg.indices[selectedIndex].th_hc:0;
   d["th_co"]  = (selectedIndex>=0)?cfg.indices[selectedIndex].th_co:0;
   d["index_label"] = (selectedIndex>=0)?cfg.indices[selectedIndex].label:String("");
+  d["log_saved"] = lastLogSaved;   // status simpan SD utk ditampilkan di web
   String s; serializeJson(d, s); wsSend(s);
 }
 
@@ -569,11 +571,22 @@ String currentTimestamp() {
   return String(b);
 }
 
-// Append 1 log entry (JSONL) ke SD
-void saveLogEntry() {
-  if (!sd_ok) { Serial.println("[LOG] SD not ready, skip"); return; }
+// Tulis 1 baris JSONL ke SD; return jumlah byte tertulis (0 = gagal)
+static size_t writeLogLine(JsonDocument& d) {
   File f = SD.open(LOG_PATH, FILE_APPEND);
-  if (!f) { Serial.println("[LOG] open fail"); return; }
+  if (!f) return 0;
+  size_t n = serializeJson(d, f);
+  if (n > 0) n += f.print('\n');
+  f.close();
+  return n;
+}
+
+// Append 1 log entry (JSONL) ke SD.
+// SD ada di bus SPI bersama TFT/Touch — kadang card "tersesat" setelah banyak
+// transaksi TFT walau init boot OK. Jika tulis gagal: remount SD lalu retry 1x.
+void saveLogEntry() {
+  lastLogSaved = false;
+  if (!sd_ok) { Serial.println("[LOG] SD not ready, skip"); return; }
 
   JsonDocument d;
   d["ts"]    = currentTimestamp();
@@ -596,10 +609,25 @@ void saveLogEntry() {
     hcArr.add(sampleHC[i]);
     coArr.add(sampleCO[i]);
   }
-  serializeJson(d, f);
-  f.print('\n');
-  f.close();
-  Serial.println("[LOG] saved");
+
+  size_t n = writeLogLine(d);
+  if (n == 0) {
+    Serial.println("[LOG] write fail -> remount SD & retry...");
+    SD.end();
+    delay(50);
+    if (SD.begin(SD_CS, SPI, 4000000)) {
+      n = writeLogLine(d);
+    } else {
+      Serial.println("[LOG] remount fail");
+      sd_ok = false;   // tandai agar terlihat di /api/status & web
+    }
+  }
+  lastLogSaved = (n > 0);
+  size_t fsize = 0;
+  File chk = SD.open(LOG_PATH, FILE_READ);
+  if (chk) { fsize = chk.size(); chk.close(); }
+  Serial.printf("[LOG] %s (%u bytes, file=%u bytes)\n",
+                lastLogSaved ? "saved" : "SAVE FAIL", (unsigned)n, (unsigned)fsize);
 }
 
 // Edit metadata (vehicle & plate) 1 entry log berdasarkan id (= indeks baris).
@@ -673,8 +701,8 @@ void enterState(SysState ns) {
       setMotor(false);
       classify();
       setBuzzerPattern(3); // long beep
+      saveLogEntry();      // simpan ke SD dulu -> status ikut di frame result
       broadcastResult();
-      saveLogEntry();      // simpan ke SD (JSONL append)
       break;
     case ST_IDLE:
       setMotor(false);
@@ -872,6 +900,7 @@ void registerRoutes() {
     d["mq7_ok"] = mq7_ok;
     d["tft_ok"] = tft_ok;
     d["sd_ok"] = sd_ok;
+    d["log_saved"] = lastLogSaved;   // status simpan log run terakhir
     d["rssi"] = WiFi.RSSI();
     d["ip"] = WiFi.localIP().toString();
     d["heap"] = ESP.getFreeHeap();
