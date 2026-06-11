@@ -176,23 +176,30 @@ float    sampleCO[MAX_SAMPLES];
 
 // SD card
 bool sd_ok = false;
-bool lastLogSaved = false;              // status simpan log terakhir (dikirim di frame result)
 const char* LOG_PATH = "/logs.jsonl";   // JSON-lines: 1 baris = 1 log entry
 const char* LOG_TMP  = "/logs.tmp";     // file sementara saat rewrite (edit entry)
 
-// --- Proteksi akses SD antar task ---
-// Handler HTTP jalan di task async_tcp (diawasi task watchdog 5 detik). Kartu SD
-// yang "wedged" membuat tiap operasi SPI timeout berulang -> handler macet >5s ->
-// task_wdt -> restart. Apalagi tab Log web auto-refresh 3 detik = restart loop.
-// Aturan: async_tcp TIDAK boleh baca SD di jalur panas. GET /api/logs dilayani
-// dari cache RAM (dibangun di loopTask). Operasi SD lain diserialisasi sdMutex
-// dengan timeout pendek + batas waktu loop baca, supaya tidak pernah kena WDT.
-SemaphoreHandle_t sdMutex = nullptr;
+// --- Arsitektur dual-core ---
+// Core 1 (loopTask)  : sensor ADC, state machine, buzzer, TFT + touch, broadcast WS,
+//                      kalibrasi non-blocking. TIDAK PERNAH menyentuh SD.
+// Core 0 (sdTask)    : SEMUA tulis SD (simpan log, rebuild cache) via antrian job.
+// async_tcp (HTTP/WS): tidak pernah I/O lama. /api/logs dilayani cache RAM;
+//                      operasi ringan (detail/edit/hapus) inline dengan lock
+//                      timeout pendek + batas waktu baca 3 detik (WDT = 5 detik).
+// ioMutex = SATU-SATUNYA lock: bus SPI (TFT/touch/SD) + logsCache. Tidak pernah
+// nested -> bebas deadlock. TFT/touch pakai try-lock singkat: kalau sdTask sedang
+// pegang bus, frame di-skip — state machine & web tetap jalan, tidak ada yang macet.
+SemaphoreHandle_t ioMutex = nullptr;
+QueueHandle_t sdQueue = nullptr;
+enum SdJobType : uint8_t { SDJOB_SAVE, SDJOB_REBUILD };
+struct SdJob { SdJobType type; String* payload; };   // payload di-delete oleh sdTask
 String logsCache = "[]";                // cache ringkasan log utk GET /api/logs
-volatile bool logsDirty = true;         // minta rebuild cache di loop()
+// Status simpan log run terakhir: -1 belum ada, 0 gagal, 1 tersimpan, 2 sedang menyimpan
+volatile int8_t logSaveState = -1;
+volatile bool   logSaveNotify = false;  // sdTask -> loop: kirim frame WS "log_saved"
 
-bool sdLock(uint32_t ms) { return sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(ms)) == pdTRUE; }
-void sdUnlock()          { if (sdMutex) xSemaphoreGive(sdMutex); }
+bool ioLock(uint32_t ms) { return ioMutex && xSemaphoreTake(ioMutex, pdMS_TO_TICKS(ms)) == pdTRUE; }
+void ioUnlock()          { if (ioMutex) xSemaphoreGive(ioMutex); }
 
 // Latest readings
 float lastHC = 0, lastCO = 0;
@@ -546,6 +553,7 @@ void broadcastData() {
   // Field state-snapshot agar web bisa self-heal walau frame "state" sempat ter-drop.
   d["selected_index"] = selectedIndex;
   d["flush"] = flushManual;
+  d["log_state"] = (int)logSaveState;   // status simpan log (self-heal note di kartu hasil)
   String s; serializeJson(d, s); wsSend(s);
 }
 void broadcastState() {
@@ -568,7 +576,6 @@ void broadcastResult() {
   d["th_hc"]  = (selectedIndex>=0)?cfg.indices[selectedIndex].th_hc:0;
   d["th_co"]  = (selectedIndex>=0)?cfg.indices[selectedIndex].th_co:0;
   d["index_label"] = (selectedIndex>=0)?cfg.indices[selectedIndex].label:String("");
-  d["log_saved"] = lastLogSaved;   // status simpan SD utk ditampilkan di web
   String s; serializeJson(d, s); wsSend(s);
 }
 
@@ -585,22 +592,26 @@ String currentTimestamp() {
   return String(b);
 }
 
-// Tulis 1 baris JSONL ke SD; return jumlah byte tertulis (0 = gagal)
-static size_t writeLogLine(JsonDocument& d) {
+// Tulis 1 baris JSONL ke SD; return jumlah byte tertulis (0 = gagal).
+// HANYA dipanggil dari sdTask (sudah pegang ioMutex).
+static size_t writeLogLine(const String& line) {
   File f = SD.open(LOG_PATH, FILE_APPEND);
   if (!f) return 0;
-  size_t n = serializeJson(d, f);
+  size_t n = f.print(line);
   if (n > 0) n += f.print('\n');
   f.close();
   return n;
 }
 
-// Append 1 log entry (JSONL) ke SD.
-// SD ada di bus SPI bersama TFT/Touch — kadang card "tersesat" setelah banyak
-// transaksi TFT walau init boot OK. Jika tulis gagal: remount SD lalu retry 1x.
+// Siapkan 1 entry log lalu ANTRIKAN ke sdTask (core 0). Dipanggil dari state
+// machine (loopTask) saat masuk RESULT — tidak menyentuh SD sama sekali, jadi
+// state machine/TFT tidak pernah ikut macet kalau kartu SD bermasalah.
 void saveLogEntry() {
-  lastLogSaved = false;
-  if (!sd_ok) { Serial.println("[LOG] SD not ready, skip"); return; }
+  if (!sd_ok || !sdQueue) {
+    logSaveState = 0; logSaveNotify = true;
+    Serial.println("[LOG] SD not ready, skip");
+    return;
+  }
 
   JsonDocument d;
   d["ts"]    = currentTimestamp();
@@ -624,30 +635,16 @@ void saveLogEntry() {
     coArr.add(sampleCO[i]);
   }
 
-  if (!sdLock(3000)) {
-    Serial.println("[LOG] SAVE FAIL: SD busy (mutex timeout)");
-    return;
+  String* line = new String();
+  serializeJson(d, *line);
+  SdJob job{SDJOB_SAVE, line};
+  if (xQueueSend(sdQueue, &job, 0) == pdTRUE) {
+    logSaveState = 2;   // pending — sdTask di core 0 yang menuntaskan
+  } else {
+    delete line;
+    logSaveState = 0; logSaveNotify = true;
+    Serial.println("[LOG] queue penuh, save gagal");
   }
-  size_t n = writeLogLine(d);
-  if (n == 0) {
-    Serial.println("[LOG] write fail -> remount SD & retry...");
-    SD.end();
-    delay(50);
-    if (SD.begin(SD_CS, SPI, 4000000)) {
-      n = writeLogLine(d);
-    } else {
-      Serial.println("[LOG] remount fail");
-      sd_ok = false;   // tandai agar terlihat di /api/status & web
-    }
-  }
-  lastLogSaved = (n > 0);
-  size_t fsize = 0;
-  File chk = SD.open(LOG_PATH, FILE_READ);
-  if (chk) { fsize = chk.size(); chk.close(); }
-  sdUnlock();
-  logsDirty = true;   // rebuild cache daftar log di loop()
-  Serial.printf("[LOG] %s (%u bytes, file=%u bytes)\n",
-                lastLogSaved ? "saved" : "SAVE FAIL", (unsigned)n, (unsigned)fsize);
 }
 
 // Edit metadata (vehicle & plate) 1 entry log berdasarkan id (= indeks baris).
@@ -698,21 +695,19 @@ bool editLogEntry(int wantId, const String& vehicle, const String& plate) {
   return SD.rename(LOG_TMP, LOG_PATH);
 }
 
-// Bangun ulang cache ringkasan log (dipanggil dari loop() saat logsDirty).
-// GET /api/logs hanya membaca cache RAM ini — task async_tcp bebas dari SD.
-// Return true jika cache valid (logsDirty boleh di-clear).
-bool rebuildLogsCache() {
-  if (!sd_ok || !SD.exists(LOG_PATH)) {
-    if (sdLock(100)) { logsCache = "[]"; sdUnlock(); return true; }
-    return false;
-  }
-  if (!sdLock(2000)) return false;   // SD sibuk -> coba lagi tick berikutnya
+// Bangun ulang cache ringkasan log. HANYA dipanggil dari sdTask (sudah pegang
+// ioMutex). GET /api/logs hanya membaca cache RAM ini.
+void rebuildLogsCache() {
+  if (!sd_ok || !SD.exists(LOG_PATH)) { logsCache = "[]"; return; }
   File f = SD.open(LOG_PATH, FILE_READ);
-  if (!f) { logsCache = "[]"; sdUnlock(); return true; }
+  if (!f) { logsCache = "[]"; return; }
   JsonDocument outDoc;
   JsonArray arr = outDoc.to<JsonArray>();
   int id = 0;
+  uint32_t t0 = millis();
   while (f.available()) {
+    // Kartu lambat/wedged: pakai sebagian saja, jangan tahan ioMutex kelamaan
+    if (millis() - t0 > 4000) break;
     String line = f.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
@@ -734,8 +729,46 @@ bool rebuildLogsCache() {
   f.close();
   logsCache = "";
   serializeJson(outDoc, logsCache);
-  sdUnlock();
-  return true;
+}
+
+// Worker SD di CORE 0 — satu-satunya penulis SD card. Ambil job dari antrian,
+// pegang ioMutex selama operasi (TFT di core 1 cuma skip frame sebentar),
+// lalu lapor hasil ke loopTask via logSaveNotify.
+void sdTaskLoop(void*) {
+  SdJob job;
+  for (;;) {
+    if (xQueueReceive(sdQueue, &job, portMAX_DELAY) != pdTRUE) continue;
+    if (job.type == SDJOB_SAVE) {
+      bool ok = false;
+      size_t n = 0;
+      if (ioLock(8000)) {
+        n = writeLogLine(*job.payload);
+        if (n == 0) {
+          Serial.println("[LOG] write fail -> remount SD & retry...");
+          SD.end();
+          delay(50);
+          if (SD.begin(SD_CS, SPI, 4000000)) {
+            n = writeLogLine(*job.payload);
+          } else {
+            Serial.println("[LOG] remount fail");
+            sd_ok = false;   // tandai agar terlihat di /api/status & web
+          }
+        }
+        ok = (n > 0);
+        ioUnlock();
+      } else {
+        Serial.println("[LOG] SAVE FAIL: ioMutex timeout");
+      }
+      delete job.payload;
+      logSaveState = ok ? 1 : 0;
+      logSaveNotify = true;
+      Serial.printf("[LOG] %s (%u bytes)\n", ok ? "saved" : "SAVE FAIL", (unsigned)n);
+      SdJob r{SDJOB_REBUILD, nullptr};
+      xQueueSend(sdQueue, &r, 0);   // refresh cache daftar log
+    } else if (job.type == SDJOB_REBUILD) {
+      if (ioLock(8000)) { rebuildLogsCache(); ioUnlock(); }
+    }
+  }
 }
 
 // ---------------- State machine transitions ----------------
@@ -769,7 +802,7 @@ void enterState(SysState ns) {
       setMotor(false);
       classify();
       setBuzzerPattern(3); // long beep
-      saveLogEntry();      // simpan ke SD dulu -> status ikut di frame result
+      saveLogEntry();      // antrikan ke sdTask (core 0); hasil via frame log_saved
       broadcastResult();
       break;
     case ST_IDLE:
@@ -968,7 +1001,7 @@ void registerRoutes() {
     d["mq7_ok"] = mq7_ok;
     d["tft_ok"] = tft_ok;
     d["sd_ok"] = sd_ok;
-    d["log_saved"] = lastLogSaved;   // status simpan log run terakhir
+    d["log_state"] = (int)logSaveState;   // -1 belum ada, 0 gagal, 1 ok, 2 menyimpan
     d["rssi"] = WiFi.RSSI();
     d["ip"] = WiFi.localIP().toString();
     d["heap"] = ESP.getFreeHeap();
@@ -984,14 +1017,14 @@ void registerRoutes() {
   // === LOG endpoints (SD card) ===
   // ATURAN: handler ini jalan di task async_tcp (task watchdog 5 detik) — tidak
   // boleh blocking lama di SD. Daftar log dilayani dari cache RAM; operasi SD
-  // langsung selalu pakai sdLock timeout pendek + batas waktu loop baca.
+  // langsung selalu pakai ioLock timeout pendek + batas waktu loop baca.
 
   // GET /api/logs        -> daftar ringkasan dari CACHE RAM (tanpa sentuh SD)
   server.on("/api/logs", HTTP_GET, [](AsyncWebServerRequest* req){
     if (!sd_ok) { req->send(503, "application/json", "{\"err\":\"sd_not_ready\"}"); return; }
-    if (!sdLock(100)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
+    if (!ioLock(100)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
     String out = logsCache;   // copy singkat di dalam lock (hindari race dgn rebuild)
-    sdUnlock();
+    ioUnlock();
     req->send(200, "application/json", out);
   });
 
@@ -1000,14 +1033,14 @@ void registerRoutes() {
     if (!sd_ok) { req->send(503, "application/json", "{\"err\":\"sd_not_ready\"}"); return; }
     if (!req->hasParam("id")) { req->send(400, "application/json", "{\"err\":\"need_id\"}"); return; }
     int wantId = req->getParam("id")->value().toInt();
-    if (!sdLock(250)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
+    if (!ioLock(500)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
     File f = SD.open(LOG_PATH, FILE_READ);
-    if (!f) { sdUnlock(); req->send(404, "application/json", "{\"err\":\"no_log\"}"); return; }
+    if (!f) { ioUnlock(); req->send(404, "application/json", "{\"err\":\"no_log\"}"); return; }
     int id = 0;
     uint32_t t0 = millis();
     while (f.available()) {
       if (millis() - t0 > 3000) {   // SD lambat/wedged: gagal sebelum kena WDT
-        f.close(); sdUnlock();
+        f.close(); ioUnlock();
         req->send(504, "application/json", "{\"err\":\"sd_timeout\"}");
         return;
       }
@@ -1015,13 +1048,13 @@ void registerRoutes() {
       line.trim();
       if (line.length() == 0) continue;
       if (id == wantId) {
-        f.close(); sdUnlock();
+        f.close(); ioUnlock();
         req->send(200, "application/json", line);
         return;
       }
       id++;
     }
-    f.close(); sdUnlock();
+    f.close(); ioUnlock();
     req->send(404, "application/json", "{\"err\":\"id_not_found\"}");
   });
 
@@ -1037,11 +1070,12 @@ void registerRoutes() {
       vehicle.trim(); plate.trim();
       if (vehicle.length() > 40) vehicle = vehicle.substring(0, 40);
       if (plate.length()   > 20) plate   = plate.substring(0, 20);
-      if (!sdLock(250)) { req->send(503, "application/json", "{\"ok\":false,\"err\":\"busy\"}"); return; }
+      if (!ioLock(500)) { req->send(503, "application/json", "{\"ok\":false,\"err\":\"busy\"}"); return; }
       bool ok = editLogEntry(wantId, vehicle, plate);
-      sdUnlock();
+      ioUnlock();
       if (ok) {
-        logsDirty = true;   // refresh cache daftar log
+        SdJob r{SDJOB_REBUILD, nullptr};
+        xQueueSend(sdQueue, &r, 0);   // refresh cache daftar log
         req->send(200, "application/json", "{\"ok\":true}");
       } else {
         req->send(404, "application/json", "{\"ok\":false,\"err\":\"id_not_found\"}");
@@ -1052,10 +1086,11 @@ void registerRoutes() {
   // DELETE /api/logs     -> hapus semua log
   server.on("/api/logs", HTTP_DELETE, [](AsyncWebServerRequest* req){
     if (!sd_ok) { req->send(503, "application/json", "{\"err\":\"sd_not_ready\"}"); return; }
-    if (!sdLock(250)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
+    if (!ioLock(500)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
     if (SD.exists(LOG_PATH)) SD.remove(LOG_PATH);
-    sdUnlock();
-    logsDirty = true;
+    ioUnlock();
+    SdJob r{SDJOB_REBUILD, nullptr};
+    xQueueSend(sdQueue, &r, 0);
     req->send(200, "application/json", "{\"ok\":true}");
   });
 
@@ -1706,7 +1741,7 @@ void setup() {
   bootStep(4, "Settings", 1, detail);
 
   // --- SD Card ---
-  sdMutex = xSemaphoreCreateMutex();   // serialisasi akses SD loopTask vs async_tcp
+  ioMutex = xSemaphoreCreateMutex();   // lock tunggal bus SPI + cache (lihat komentar global)
   Serial.println("    SD.begin...");
   // SD share SPI dengan TFT/touch. Pastikan slave lain deselect, lalu coba beberapa frekuensi.
   digitalWrite(TFT_CS,   HIGH);
@@ -1769,8 +1804,6 @@ void setup() {
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
   registerRoutes();
-  server.begin();
-  Serial.println("    Web OK");
   bootStep(8, "Web Server", 1, "port 80");
 
   // Footer "ready"
@@ -1782,6 +1815,16 @@ void setup() {
   enterState(ST_IDLE);
   tftDrawIdle();
   lastTftState = ST_IDLE;
+
+  // Worker SD di CORE 0 — dibuat SETELAH semua gambar boot TFT selesai (tidak
+  // ada akses SPI tanpa lock yang tumpang-tindih). server.begin() paling akhir:
+  // handler baru boleh menerima request saat ioMutex & sdQueue sudah siap.
+  sdQueue = xQueueCreate(8, sizeof(SdJob));
+  xTaskCreatePinnedToCore(sdTaskLoop, "sdTask", 8192, nullptr, 1, nullptr, 0);
+  SdJob initJob{SDJOB_REBUILD, nullptr};
+  xQueueSend(sdQueue, &initJob, 0);   // isi cache daftar log saat boot
+  server.begin();
+  Serial.println("    Web OK");
   Serial.println("=== READY ===");
 }
 
@@ -1799,22 +1842,39 @@ void loop() {
     }
   }
   calibTick();   // kalibrasi non-blocking (no-op jika tidak aktif)
-  // Rebuild cache daftar log di loopTask (async_tcp hanya baca cache RAM)
-  if (logsDirty && rebuildLogsCache()) logsDirty = false;
-  // dispatch touch (di-throttle: kurangi kerapatan transaksi SPI touch vs TFT)
+
+  // Touch + TFT = satu-satunya pengguna SPI di loopTask. Try-lock singkat:
+  // kalau sdTask (core 0) sedang pegang bus, frame ini di-skip dan dicoba lagi
+  // iterasi berikutnya — state machine, sensor, dan web TIDAK ikut menunggu.
   static uint32_t lastTouchPoll = 0;
   if (now - lastTouchPoll >= TOUCH_POLL_MS) {
     lastTouchPoll = now;
-    int tx, ty;
-    if (getTouch(&tx, &ty)) {
-      delayMicroseconds(50);   // beri jeda agar bus SPI touch settle sebelum TFT
-      dispatchTouch(tx, ty);
+    if (ioLock(25)) {
+      int tx, ty;
+      if (getTouch(&tx, &ty)) {
+        delayMicroseconds(50);   // beri jeda agar bus SPI touch settle sebelum TFT
+        dispatchTouch(tx, ty);
+      }
+      ioUnlock();
     }
   }
 
   tickStateMachine();
   handleBuzzer();
-  tftRefresh();
+  if (ioLock(25)) {
+    tftRefresh();
+    ioUnlock();
+  }
+
+  // sdTask selesai menyimpan -> kabari web (note di kartu hasil + refresh tabel log)
+  if (logSaveNotify) {
+    logSaveNotify = false;
+    JsonDocument d;
+    d["type"] = "log_saved";
+    d["ok"]   = (logSaveState == 1);
+    String s; serializeJson(d, s); wsSend(s);
+  }
+
   if (now - lastBroadcast > 200) {
     lastBroadcast = now;
     broadcastData();

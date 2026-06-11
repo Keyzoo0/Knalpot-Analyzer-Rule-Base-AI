@@ -181,6 +181,11 @@ function handleMsg(m) {
     else if (m.phase_total > 0) extra.textContent = `${Math.round(m.elapsed/1000)}s / ${Math.round(m.phase_total/1000)}s`;
     else extra.innerHTML = '&nbsp;';
     applyServerState(m);   // self-heal sinkronisasi (modal/tombol/timeline)
+    // self-heal note status simpan log (kalau frame log_saved sempat ter-drop)
+    if (typeof m.log_state === 'number' && document.getElementById('resLogSaved') &&
+        !document.getElementById('resultBox').classList.contains('hidden')) {
+      updateLogSaveNote(m.log_state);
+    }
     if (['INHALE','PREPROCESS','SAMPLING'].includes(m.state)) pushPoint(m.hc, m.co);
   } else if (m.type === 'state') {
     applyServerState(m);
@@ -194,6 +199,12 @@ function handleMsg(m) {
     }
   } else if (m.type === 'calib_done') {
     calibDone(m);
+  } else if (m.type === 'log_saved') {
+    updateLogSaveNote(m.ok ? 1 : 0);
+    // entry baru sudah masuk cache -> refresh tabel jika tab Log terbuka
+    if (m.ok && document.getElementById('tab-log').classList.contains('active')) {
+      setTimeout(() => fetchLogs && fetchLogs(), 500);
+    }
   }
 }
 
@@ -249,25 +260,36 @@ function showResult(m){
   document.getElementById('resThHC').textContent = m.th_hc;
   document.getElementById('resThCO').textContent = m.th_co;
   document.getElementById('resIdx').textContent = m.index_label;
-  // status simpan log SD (field log_saved dari firmware; undefined = firmware lama)
-  let saveNote = document.getElementById('resLogSaved');
-  if (!saveNote) {
-    saveNote = document.createElement('div');
-    saveNote.id = 'resLogSaved';
-    saveNote.className = 'mt-2 text-xs font-medium';
-    hero.appendChild(saveNote);
-  }
-  if (m.log_saved === true) {
-    saveNote.textContent = '✓ Tersimpan di data log (SD card)';
-    saveNote.style.color = 'rgba(255,255,255,0.9)';
-  } else if (m.log_saved === false) {
-    saveNote.textContent = '✗ GAGAL simpan ke SD card — cek kartu SD!';
-    saveNote.style.color = '#fde047';
-  } else {
-    saveNote.textContent = '';
-  }
+  // simpan log berjalan async di sdTask ESP32 — tampilkan "menyimpan...",
+  // lalu frame WS 'log_saved' / field log_state di frame data yang memperbarui
+  updateLogSaveNote(2);
   // re-trigger animation
   box.classList.remove('reveal'); void box.offsetWidth; box.classList.add('reveal');
+}
+
+// Note status simpan log di kartu hasil: 2 = menyimpan, 1 = tersimpan, 0 = gagal
+function updateLogSaveNote(st) {
+  const hero = document.getElementById('resultHero');
+  if (!hero) return;
+  let note = document.getElementById('resLogSaved');
+  if (!note) {
+    note = document.createElement('div');
+    note.id = 'resLogSaved';
+    note.className = 'mt-2 text-xs font-medium';
+    hero.appendChild(note);
+  }
+  if (st === 2) {
+    note.textContent = '💾 Menyimpan ke data log (SD card)...';
+    note.style.color = 'rgba(255,255,255,0.85)';
+  } else if (st === 1) {
+    note.textContent = '✓ Tersimpan di data log (SD card)';
+    note.style.color = 'rgba(255,255,255,0.9)';
+  } else if (st === 0) {
+    note.textContent = '✗ GAGAL simpan ke SD card — cek kartu SD!';
+    note.style.color = '#fde047';
+  } else {
+    note.textContent = '';
+  }
 }
 
 // ============ Controls ============

@@ -353,21 +353,50 @@ Threshold diambil dari **index yang dipilih user** (dinamis di Settings).
 
 ## 9. Arsitektur Software
 
+### 9.0 Dual-Core Task Layout
+
+ESP32 punya 2 core; firmware membagi kerja supaya **tidak ada task yang bisa
+memblokir task lain** (akar dari semua bug restart/macet sebelumnya):
+
+```
+CORE 1 — loopTask (realtime, tidak pernah blok):
+  sensor ADC → Kalman → state machine → buzzer → TFT + touch → broadcast WS
+  → kalibrasi non-blocking. TIDAK PERNAH menyentuh SD card.
+
+CORE 0 — sdTask (worker I/O, satu-satunya penulis SD):
+  antrian job (FreeRTOS queue): SDJOB_SAVE (simpan log run), SDJOB_REBUILD
+  (bangun ulang cache daftar log). Hasil simpan dilaporkan balik ke loopTask
+  (frame WS "log_saved") — kartu hasil web menampilkan ✓/✗.
+
+async_tcp (HTTP + WebSocket, task watchdog 5 detik):
+  tidak pernah I/O lama. GET /api/logs dilayani CACHE RAM; operasi ringan
+  (detail/edit/hapus) inline dengan ioLock timeout + batas waktu baca 3 detik.
+```
+
+Sinkronisasi: **satu mutex `ioMutex`** (bus SPI TFT/touch/SD + `logsCache`),
+tidak pernah nested → bebas deadlock. TFT/touch memakai **try-lock 25ms**:
+kalau sdTask sedang menulis, frame TFT di-skip dan dicoba lagi ~20ms kemudian —
+state machine, sensor, dan web tetap berjalan normal.
+
 ### 9.1 Non-Blocking Loop
 
 ```cpp
 void loop() {
-  // 1) baca sensor tiap 200ms
+  // 1) baca sensor tiap 200ms (ADC — tanpa lock)
   if (now - lastSensorRead > 200) { readSensors(); chartPush(...); }
-  // 2) cek touch
-  if (getTouch(&tx, &ty)) dispatchTouch(tx, ty);
-  // 3) advance state machine
+  // 2) kalibrasi non-blocking (no-op jika tidak aktif)
+  calibTick();
+  // 3) cek touch (try-lock SPI; skip jika sdTask sedang pakai bus)
+  if (ioLock(25)) { if (getTouch(&tx, &ty)) dispatchTouch(tx, ty); ioUnlock(); }
+  // 4) advance state machine (RESULT -> enqueue job simpan ke sdTask)
   tickStateMachine();
-  // 4) update buzzer (millis-based)
+  // 5) update buzzer (millis-based)
   handleBuzzer();
-  // 5) refresh TFT (partial update)
-  tftRefresh();
-  // 6) broadcast WS tiap 200ms
+  // 6) refresh TFT (partial update, try-lock)
+  if (ioLock(25)) { tftRefresh(); ioUnlock(); }
+  // 7) lapor hasil simpan log dari sdTask (frame WS "log_saved")
+  if (logSaveNotify) { ... wsSend(...); }
+  // 8) broadcast WS tiap 200ms
   if (now - lastBroadcast > 200) broadcastData();
   ws.cleanupClients();
 }
@@ -410,7 +439,8 @@ ESPAsyncWebServer punya antrian per-client (`WS_MAX_QUEUED_MESSAGES`, default 32
 |---|---|---|
 | TFT layar putih / hitam | Pin SPI salah / library tidak match | Cek wiring, pastikan rotation 1, library Adafruit_ILI9341 |
 | TFT putih setelah disentuh | Clash transaksi SPI touch vs TFT (bus dibagi) + clock TFT terlalu tinggi | Sudah di-mitigasi: (1) touch tidak gambar langsung, (2) `TFT_SPI_HZ`=16MHz, (3) touch di-throttle `TOUCH_POLL_MS`=40ms + jeda settle, (4) flush pakai partial redraw. Jika MASIH putih: turunkan `TFT_SPI_HZ` ke `10000000` |
-| Restart `task_wdt: async_tcp` | Handler HTTP blocking >5 detik (task watchdog): kalibrasi blocking, atau akses SD wedged dari handler (tab Log auto-refresh 3 detik bisa memicu restart loop) | Sudah di-fix: (1) kalibrasi non-blocking via `calibTick()` di `loop()`; (2) `GET /api/logs` dilayani dari cache RAM (`logsCache`, rebuild di `loop()`); (3) semua akses SD diserialisasi `sdMutex` + batas waktu baca 3 detik di handler. Jangan pernah `delay()` panjang atau I/O lambat di handler AsyncWebServer |
+| Restart `task_wdt: async_tcp` | Handler HTTP blocking >5 detik (task watchdog): kalibrasi blocking, atau akses SD wedged dari handler (tab Log auto-refresh 3 detik bisa memicu restart loop) | Sudah di-fix dengan arsitektur dual-core (§9.0): kalibrasi non-blocking via `calibTick()`; semua tulis SD di `sdTask` core 0; `GET /api/logs` dari cache RAM; akses SD inline di handler diserialisasi `ioMutex` + batas waktu 3 detik. Jangan pernah `delay()` panjang atau I/O lambat di handler AsyncWebServer |
+| System run macet di INHALE / TFT tidak respon | Operasi SD lambat (kartu wedged) dulu dikerjakan di `loop()` → state machine & touch ikut tertahan | Sudah di-fix: simpan log & rebuild cache pindah ke `sdTask` (core 0); `loop()` (core 1) tidak pernah menyentuh SD; TFT pakai try-lock (skip frame, tidak menunggu) |
 | Touch tidak responsif | T_CS tidak tersambung / kalibrasi salah | Sambungkan T_CS ke GPIO 15. Kalibrasi ulang di `TOUCH_XMIN`..`TOUCH_YMAX` |
 | Touch koordinat meleset | Default calibration tidak match TFT Anda | Print `p.x, p.y` mentah saat tap pojok layar, update define |
 | Tombol ke-tekan berulang / hang saat ditahan | Tanpa edge-detection touch akan retrigger | Sudah di-fix: `getTouch()` pakai edge-detection (1 aksi per tekan, wajib lepas dulu). Atur `TOUCH_DEBOUNCE` / `TOUCH_PRESS_MIN` bila perlu |
