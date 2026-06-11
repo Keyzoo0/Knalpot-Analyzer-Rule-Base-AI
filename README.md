@@ -249,7 +249,7 @@ Alternatif tanpa hitung manual: tab **Settings → Kalibrasi Otomatis Target Idl
 
 1. Nyalakan mesin sampai **idle stabil**, sensor sudah preheat ≥5 menit.
 2. Isi **Target HC (ppm)** dan **Target CO (%)** — nilai pembacaan yang diinginkan untuk kondisi idle saat ini (default HC=75 ppm, CO=0.29%).
-3. Tekan **Mulai Kalibrasi**. ESP32 merata-rata Rs selama ~3 detik (20 sampel), lalu back-solve R0 dari curve datasheet:
+3. Tekan **Mulai Kalibrasi**. ESP32 merata-rata Rs selama ~10 detik (50 sampel), lalu back-solve R0 dari curve datasheet:
    ```
    R0 = Rs × (target_ppm / a)^(-1/b)
    ```

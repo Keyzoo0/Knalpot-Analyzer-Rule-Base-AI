@@ -90,7 +90,7 @@ const char* WIFI_PASS = "12345678";
 // Target kalibrasi idle default (bisa diubah dari web): HC=75 ppm, CO=0.29% (=2900 ppm)
 #define CALIB_TARGET_HC_PPM   75.0f
 #define CALIB_TARGET_CO_PPM   2900.0f
-#define CALIB_SAMPLES         20      // 20 sampel x ~150ms ≈ 3 detik
+#define CALIB_SAMPLES         50      // 50 sampel x ~200ms ≈ 10 detik
 
 // ---------------- Globals ----------------
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
@@ -366,7 +366,7 @@ bool calibrateTargetIdle(float targetHcPpm, float targetCoPpm,
     if (a2 >= 4095 || a7 >= 4095) return false;
     rs2_sum += vmoduleToRs(vadcToVmodule(adcToVadc(a2)));
     rs7_sum += vmoduleToRs(vadcToVmodule(adcToVadc(a7)));
-    delay(120);
+    delay(195);   // + ~5ms readAdcAvg x2 -> ~200ms per sampel
   }
   float rs2 = rs2_sum / CALIB_SAMPLES;
   float rs7 = rs7_sum / CALIB_SAMPLES;

@@ -414,7 +414,7 @@ document.getElementById('btnCalibrate').addEventListener('click', async () => {
   }
   if (!confirm(`Pastikan motor menyala IDLE STABIL dan sensor sudah preheat ≥5 menit.\n\nTarget kalibrasi:\n• HC = ${tHc} ppm\n• CO = ${tCo} %\n\nLanjutkan kalibrasi?`)) return;
   btn.disabled = true;
-  msg.textContent = 'Mengukur (~3 detik)...';
+  msg.textContent = 'Mengukur (~10 detik)...';
   msg.className = 'text-xs font-medium text-amber-700';
   try {
     const r = await fetch(`/api/calibrate?hc=${encodeURIComponent(tHc)}&co=${encodeURIComponent(tCo)}`, { method: 'POST' });
