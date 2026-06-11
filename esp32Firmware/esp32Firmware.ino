@@ -718,9 +718,16 @@ void rebuildLogsCache() {
   JsonArray arr = outDoc.to<JsonArray>();
   int id = 0;
   uint32_t t0 = millis();
+  size_t prevPos = (size_t)-1;
   while (f.available()) {
     // Kartu lambat/wedged: pakai sebagian saja, jangan tahan ioMutex kelamaan
     if (millis() - t0 > 4000) break;
+    // Baca macet (posisi tidak maju) = cluster file rusak -> berhenti, jangan spin
+    if (f.position() == prevPos) {
+      Serial.println("[CACHE] baca macet — file log korup? (cek /logs.bad)");
+      break;
+    }
+    prevPos = f.position();
     String line = f.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
@@ -774,6 +781,16 @@ void sdTaskLoop(void*) {
           } else {
             Serial.println("[LOG] remount fail");
           }
+        }
+        if (n == 0 && SD.exists(LOG_PATH)) {
+          // Kasus nyata di lapangan: file log lama menempati cluster rusak —
+          // append/baca ke file ITU gagal padahal file baru normal (self-test
+          // PASS). Karantina file korup, mulai file baru di cluster sehat.
+          Serial.println("[LOG] karantina file log korup -> /logs.bad");
+          SD.remove("/logs.bad");
+          SD.rename(LOG_PATH, "/logs.bad");
+          vTaskDelay(pdMS_TO_TICKS(20));
+          n = writeLogLine(*job.payload);
         }
         ok = (n > 0);
         ioUnlock();
