@@ -65,8 +65,8 @@
 #define TOUCH_POLL_MS   15
 
 // ---------------- WIFI ----------------
-const char* WIFI_SSID = "ROSI1";
-const char* WIFI_PASS = "20517420";
+const char* WIFI_SSID = "Biznet";
+const char* WIFI_PASS = "12345678";
 
 // ---------------- FIREBASE (Firestore via REST API) ----------------
 // Tanpa library Firebase — pakai HTTPClient + ArduinoJson saja.

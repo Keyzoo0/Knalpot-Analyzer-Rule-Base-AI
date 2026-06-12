@@ -15,7 +15,8 @@ ESP32-based exhaust gas analyzer untuk menilai kualitas pembakaran motor via **R
 | State machine 7 state | IDLE → SELECT_IDX → WAIT_VALVE → INHALE → PREPROCESS → SAMPLING → RESULT |
 | Rule Based AI | 4 kategori: Normal / Gejala Awal / Misfire / Tidak Normal |
 | Threshold dinamis | Per "index tahun motor" — bisa ditambah, dihapus, edit via web |
-| Web dashboard | 3 tab (Dashboard / Settings / Info) dengan Tailwind + Chart.js via CDN |
+| Data log cloud | Hasil tiap run di-upload ESP32 ke **Firebase Firestore** (REST API murni, tanpa library); tab Log web **realtime** via `onSnapshot` |
+| Web dashboard | 4 tab (Dashboard / Settings / Log / Info) dengan Tailwind + Chart.js via CDN |
 | TFT touchscreen | 5 layar (Idle / Select / Valve / Run / Result) dengan tombol on-screen |
 | Chart real-time | Di web (Chart.js dual-axis) dan TFT (custom ring buffer 80 titik) |
 | Sinkronisasi dua arah | Aksi dari TFT auto-update web, dan sebaliknya, via WebSocket |
@@ -198,9 +199,20 @@ Tap **layar TFT** atau klik **web** — keduanya sinkron. Pilih index dari TFT a
 
 Klik **Simpan Settings** → semua tersimpan di NVS, bertahan setelah reboot.
 
-### 5.5 Tab Log (Data Logger — Firebase Firestore)
+### 5.5 Tab Log (Data Logger — Firebase Firestore, realtime)
 
-Setiap hasil pengujian (state RESULT) otomatis **diupload ke Firebase Firestore** (koleksi `logs`, 1 dokumen per pengujian) lewat **REST API murni** — tanpa library Firebase, hanya `HTTPClient` + `WiFiClientSecure` + `ArduinoJson`. Setiap dokumen berisi:
+Pembagian peran penyimpanan log:
+
+```
+ESP32  = WRITE-ONLY : selesai system run → upload 1 dokumen ke Firestore
+                      (REST API murni: HTTPClient + WiFiClientSecure + ArduinoJson,
+                       TANPA library Firebase)
+WEB    = READ/EDIT  : browser membaca Firestore LANGSUNG via Firebase JS SDK
+                      (data/firebase.js) dengan realtime listener onSnapshot —
+                      tabel ter-update OTOMATIS saat ada log baru, tanpa refresh
+```
+
+Setiap dokumen di koleksi `logs` berisi:
 
 - `ts`: timestamp (NTP, format ISO 8601 WIB) + `created` (epoch, kunci urutan)
 - `vehicle`, `plate`: data kendaraan (diedit dari web)
@@ -209,16 +221,17 @@ Setiap hasil pengujian (state RESULT) otomatis **diupload ke Firebase Firestore*
 - `s_hc[]`, `s_co[]`: array nilai sample HC/CO selama tahap SAMPLING (untuk replay grafik)
 
 Di tab Log, web menampilkan:
-- **Tabel riwayat** (terbaru di atas, maks `FS_PAGE_SIZE` = 20 entri ter-cache) — kolom: #, Waktu, Kendaraan, Plat, Kategori, AVG HC, AVG CO, Hasil
-- Tombol **Refresh**, **Download** (export JSON), **Hapus Semua**
-- Klik **Detail** → modal dengan grafik per-sample HC & CO (Chart.js) + form edit kendaraan/plat
+- **Tabel riwayat realtime** (terbaru di atas, `limit 100` di listener) — kolom: #, Waktu, Kendaraan, Plat, Kategori, AVG HC, AVG CO, Hasil
+- Tombol **Refresh** (render ulang), **Download** (export JSON client-side), **Hapus Semua** (`deleteDoc` langsung dari browser)
+- Klik **Detail** → modal grafik per-sample HC & CO (Chart.js) + form edit kendaraan/plat (`updateDoc` langsung dari browser)
 
-Alur data: ESP32 meng-cache daftar log di RAM (`logsCache`, diisi `fbTask`); web hanya membaca cache via `/api/logs` — cepat dan tidak membebani Firestore. Setelah save/edit/hapus selesai di Firebase, ESP32 mengirim frame WS `logs_updated` dan tabel web refresh otomatis.
+Alur kendali tetap lewat ESP32 (WebSocket); hanya DATA LOG yang lewat Firestore. Kartu hasil di Dashboard menampilkan status upload ("☁️ Menyimpan..." → ✓/✗) via frame WS `log_saved`. Karena tab Log membaca cloud, browser klien **wajib internet** (CDN gstatic + Firestore) — konsisten dengan Chart.js/Tailwind yang juga CDN.
 
 #### Setup Firebase (sekali saja, di Firebase Console)
 
 1. Buat project di https://console.firebase.google.com
-2. **Build → Firestore Database → Create database** (mode production)
+2. **Build → Firestore Database → Create database** (mode production).
+   Perhatikan **Database ID** yang dipilih — bisa `(default)` atau nama lain.
 3. **Rules** Firestore:
    ```
    rules_version = '2';
@@ -230,11 +243,15 @@ Alur data: ESP32 meng-cache daftar log di RAM (`logsCache`, diisi `fbTask`); web
      }
    }
    ```
-4. **Authentication → Sign-in method**: aktifkan **Email/Password**, lalu **Users → Add user** (email & password untuk ESP32)
-5. Salin ke firmware (`esp32Firmware.ino` bagian `FIREBASE`):
-   - `FB_API_KEY` ← Project Settings → General → **Web API Key**
-   - `FB_PROJECT_ID` ← Project Settings → General → **Project ID**
-   - `FB_EMAIL` / `FB_PASSWORD` ← user yang dibuat di langkah 4
+4. **Authentication → Sign-in method**: aktifkan **Email/Password**, lalu **Users → Add user**
+5. Salin kredensial ke DUA tempat:
+   - **Firmware** (`esp32Firmware.ino` bagian `FIREBASE`): `FB_API_KEY` (Project Settings → Web API Key), `FB_PROJECT_ID`, `FB_DATABASE_ID` (ID dari langkah 2 — project ini memakai `default`), `FB_EMAIL`/`FB_PASSWORD`
+   - **Web** (`data/firebase.js`): object `firebaseConfig` (dari Project Settings → Your apps → Web app) + email/password + database ID di `getFirestore(app, '<id>')`
+
+> Catatan teknis: ESP32 memakai endpoint `POST .../documents/logs` dengan header
+> `Authorization: Bearer <idToken>` (Identity Toolkit `signInWithPassword`, token
+> di-refresh otomatis tiap <1 jam oleh `fbTask`). Nilai integer Firestore wajib
+> dikirim sebagai string (`integerValue`), double sebagai angka (`doubleValue`).
 
 ### 5.6 Tab Info
 
@@ -334,10 +351,9 @@ Threshold diambil dari **index yang dipilih user** (dinamis di Settings).
 | `/api/settings` | GET | JSON konfigurasi lengkap |
 | `/api/settings` | POST | JSON (sebagian field OK) → simpan |
 | `/api/status` | GET | snapshot state + sensor + sistem (termasuk `fb_ok`, `log_state`) |
-| `/api/logs` | GET | array log lengkap dari cache RAM (termasuk samples — dipakai tabel & modal detail) |
-| `/api/log/edit?id=<docId>` | POST | `{vehicle, plate}` → antrikan PATCH Firestore, respon instan `{ok,queued}` |
-| `/api/logs` | DELETE | antrikan hapus semua dokumen Firestore |
-| `/api/logs/download` | GET | export cache log sebagai file JSON |
+
+> Tidak ada endpoint log di ESP32 — daftar/detail/edit/hapus log dilakukan
+> browser **langsung ke Firestore** via Firebase JS SDK (`data/firebase.js`).
 
 #### Contoh `/api/settings`:
 ```json
@@ -391,20 +407,19 @@ CORE 1 — loopTask (realtime, tidak pernah blok):
   sensor ADC → Kalman → state machine → buzzer → TFT + touch → broadcast WS
   → kalibrasi non-blocking. TIDAK PERNAH melakukan HTTP.
 
-CORE 0 — fbTask (worker jaringan, satu-satunya yang bicara ke Firebase):
-  antrian job (FreeRTOS queue): FBJOB_SAVE (upload log run ke Firestore),
-  FBJOB_REBUILD (sync cache daftar log), FBJOB_EDIT (PATCH vehicle/plate),
-  FBJOB_DELETE_ALL. Auth idToken (~1 jam) di-refresh otomatis sebelum job.
-  Hasil dilaporkan balik ke loopTask (frame WS "log_saved"/"logs_updated").
+CORE 0 — fbTask (worker jaringan, ESP32 WRITE-ONLY ke Firestore):
+  antrian job (FreeRTOS queue): FBJOB_SAVE — upload 1 dokumen log saat selesai
+  system run. Auth idToken (~1 jam) di-refresh otomatis sebelum tiap job.
+  Hasil dilaporkan balik ke loopTask (frame WS "log_saved").
+  (Baca/edit/hapus log = urusan browser via Firebase JS SDK, bukan ESP32.)
 
 async_tcp (HTTP + WebSocket, task watchdog 5 detik):
-  tidak pernah I/O lama. GET /api/logs dilayani CACHE RAM; edit/hapus hanya
-  MENGANTRIKAN job ke fbTask lalu respon instan.
+  tidak pernah I/O lama — hanya kontrol/state/settings.
 ```
 
-Sinkronisasi: **satu mutex `ioMutex`** (bus SPI TFT/touch + `logsCache`),
-tidak pernah nested → bebas deadlock. HTTPS bisa makan waktu detik — karena
-semuanya di fbTask, state machine, TFT, dan web tidak pernah ikut menunggu.
+Sinkronisasi: **satu mutex `ioMutex`** (bus SPI TFT/touch), tidak pernah
+nested → bebas deadlock. HTTPS bisa makan waktu detik — karena semuanya di
+fbTask, state machine, TFT, dan web tidak pernah ikut menunggu.
 
 ### 9.1 Non-Blocking Loop
 
@@ -422,7 +437,7 @@ void loop() {
   handleBuzzer();
   // 6) refresh TFT (partial update, try-lock)
   if (ioLock(25)) { tftRefresh(); ioUnlock(); }
-  // 7) lapor hasil dari fbTask (frame WS "log_saved" / "logs_updated")
+  // 7) lapor hasil upload dari fbTask (frame WS "log_saved")
   if (logSaveNotify) { ... wsSend(...); }
   // 8) broadcast WS tiap 200ms
   if (now - lastBroadcast > 200) broadcastData();
@@ -436,9 +451,10 @@ Tidak ada `delay()` di loop. Semua timing pakai `millis()`.
 
 | File | Tanggung Jawab |
 |---|---|
-| `esp32Firmware.ino` | State machine, sensor reading, TFT/Touch, WebServer/WS, Buzzer, Settings (NVS) |
-| `data/index.html` | Markup 3 tab + modal + thesis card |
-| `data/app.js` | WebSocket client, Chart.js, fetch settings, sync UI dengan state server |
+| `esp32Firmware.ino` | State machine, sensor reading, TFT/Touch, WebServer/WS, Buzzer, Settings (NVS), upload log ke Firestore (`fbTask`, write-only) |
+| `data/index.html` | Markup 4 tab + modal + thesis card |
+| `data/app.js` | WebSocket client, Chart.js, fetch settings, sync UI dengan state server, render tabel log |
+| `data/firebase.js` | Firebase JS SDK (module): auth + realtime listener Firestore (`onSnapshot`) → event `fb-logs`/`fb-status`; edit (`updateDoc`) & hapus semua (`deleteDoc`) |
 
 ### 9.3 Sinkronisasi TFT ↔ Web
 
@@ -467,9 +483,11 @@ ESPAsyncWebServer punya antrian per-client (`WS_MAX_QUEUED_MESSAGES`, default 32
 |---|---|---|
 | TFT layar putih / hitam | Pin SPI salah / library tidak match | Cek wiring, pastikan rotation 1, library Adafruit_ILI9341 |
 | TFT putih setelah disentuh | Clash transaksi SPI touch vs TFT (bus dibagi) + clock TFT terlalu tinggi | Sudah di-mitigasi: (1) touch tidak gambar langsung, (2) `TFT_SPI_HZ`=16MHz, (3) touch di-throttle `TOUCH_POLL_MS`=40ms + jeda settle, (4) flush pakai partial redraw. Jika MASIH putih: turunkan `TFT_SPI_HZ` ke `10000000` |
-| Restart `task_wdt: async_tcp` | Handler HTTP blocking >5 detik (task watchdog): kalibrasi blocking / I/O lama di handler | Sudah di-fix dengan arsitektur dual-core (§9.0): kalibrasi non-blocking via `calibTick()`; semua HTTP Firebase di `fbTask` core 0; `GET /api/logs` dari cache RAM. Jangan pernah `delay()` panjang atau I/O lambat di handler AsyncWebServer |
-| Log gagal tersimpan (✗ di kartu hasil) | WiFi tanpa internet / kredensial Firebase salah / rules menolak | Cek serial `[FB] auth ...` & `[LOG] ...`. Pastikan `FB_API_KEY`/`FB_PROJECT_ID`/`FB_EMAIL`/`FB_PASSWORD` benar, Email/Password sign-in aktif, rules Firestore `request.auth != null` |
-| Tab Log kosong / "Firebase tidak terhubung" | Auth belum sukses (`fb_ok=false`) | Sama seperti di atas; lihat juga `GET /api/status` field `fb_ok` |
+| Restart `task_wdt: async_tcp` | Handler HTTP blocking >5 detik (task watchdog): kalibrasi blocking / I/O lama di handler | Sudah di-fix dengan arsitektur dual-core (§9.0): kalibrasi non-blocking via `calibTick()`; semua HTTP Firebase di `fbTask` core 0. Jangan pernah `delay()` panjang atau I/O lambat di handler AsyncWebServer |
+| Log gagal tersimpan (✗ di kartu hasil) | WiFi ESP32 tanpa internet / kredensial Firebase salah / rules menolak / database ID salah | Cek serial `[FB] auth ...` & `[LOG] ...`. Pastikan `FB_API_KEY`/`FB_PROJECT_ID`/`FB_DATABASE_ID`/`FB_EMAIL`/`FB_PASSWORD` benar, Email/Password sign-in aktif, rules `request.auth != null` |
+| Tab Log kosong / "Firebase tidak terhubung" | Browser klien tanpa internet, atau config `data/firebase.js` salah | Buka DevTools Console: error `[FB] auth/snapshot` akan terlihat. Pastikan HP/laptop punya internet (tabel log dibaca browser langsung dari Firestore, bukan dari ESP32) |
+| Firestore 403 `PERMISSION_DENIED` saat list padahal rules benar | `documents.list` GET ditolak rules di beberapa setup; `runQuery`/get/create lolos | Web memakai SDK (onSnapshot) yang tidak kena masalah ini. Jika akses manual via REST: gunakan `POST :runQuery`, bukan GET list |
+| Firestore 404 `database (default) does not exist` | Database dibuat dengan ID custom (console baru) | Cocokkan `FB_DATABASE_ID` (firmware) dan `getFirestore(app,'<id>')` (web) dengan ID di console — project ini memakai `default` |
 | Touch tidak responsif | T_CS tidak tersambung / kalibrasi salah | Sambungkan T_CS ke GPIO 15. Kalibrasi ulang di `TOUCH_XMIN`..`TOUCH_YMAX` |
 | Touch koordinat meleset | Default calibration tidak match TFT Anda | Print `p.x, p.y` mentah saat tap pojok layar, update define |
 | Tombol ke-tekan berulang / hang saat ditahan | Tanpa edge-detection touch akan retrigger | Sudah di-fix: `getTouch()` pakai edge-detection (1 aksi per tekan, wajib lepas dulu). Atur `TOUCH_DEBOUNCE` / `TOUCH_PRESS_MIN` bila perlu |
