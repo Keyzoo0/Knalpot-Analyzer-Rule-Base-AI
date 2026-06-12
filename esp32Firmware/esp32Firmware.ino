@@ -79,6 +79,9 @@ const char* WIFI_PASS = "20517420";
 //                   Rules: allow read, write: if request.auth != null;
 #define FB_API_KEY    "AIzaSyA_eSYwlhtGTVbXZ5QJ6GlNKLeQfm5esRo"
 #define FB_PROJECT_ID "bayulogdatabase"
+// ID database Firestore — console baru bisa membuat ID selain "(default)".
+// Cek di Firebase Console -> Firestore Database (dropdown nama database).
+#define FB_DATABASE_ID "default"
 #define FB_EMAIL      "admin@gmail.com"
 #define FB_PASSWORD   "admin123"
 #define FS_COLLECTION "logs"     // nama koleksi Firestore untuk data log
@@ -667,7 +670,15 @@ bool fbEnsureAuth() { return fbTokenValid() ? true : fbAuth(); }
 
 String fsBaseUrl() {
   return String("https://firestore.googleapis.com/v1/projects/") + FB_PROJECT_ID +
-         "/databases/(default)/documents/" + FS_COLLECTION;
+         "/databases/" FB_DATABASE_ID "/documents/" + FS_COLLECTION;
+}
+
+// Endpoint structured query. Daftar log memakai :runQuery (bukan documents.list)
+// karena list GET ditolak rules pada beberapa setup, sedangkan runQuery dievaluasi
+// normal — terbukti saat pengujian project ini (list=403, runQuery=200).
+String fsQueryUrl() {
+  return String("https://firestore.googleapis.com/v1/projects/") + FB_PROJECT_ID +
+         "/databases/" FB_DATABASE_ID "/documents:runQuery";
 }
 
 // Request Firestore generik (POST/PATCH/DELETE) — respon kecil, body dibuang.
@@ -767,19 +778,24 @@ bool fbRebuildCache() {
   client.setInsecure();
   HTTPClient http;
   http.useHTTP10(true);   // matikan chunked encoding supaya stream bisa di-parse
-  String url = fsBaseUrl() + "?pageSize=" + String(FS_PAGE_SIZE) + "&orderBy=created%20desc";
-  if (!http.begin(client, url)) return false;
+  if (!http.begin(client, fsQueryUrl())) return false;
   http.addHeader("Authorization", String("Bearer ") + fbToken);
+  http.addHeader("Content-Type", "application/json");
   http.setTimeout(15000);
-  int code = http.GET();
+  String q = String("{\"structuredQuery\":{\"from\":[{\"collectionId\":\"" FS_COLLECTION "\"}],"
+                    "\"orderBy\":[{\"field\":{\"fieldPath\":\"created\"},\"direction\":\"DESCENDING\"}],"
+                    "\"limit\":") + FS_PAGE_SIZE + "}}";
+  int code = http.POST(q);
   if (code != 200) {
-    Serial.printf("[CACHE] list HTTP %d\n", code);
+    Serial.printf("[CACHE] runQuery HTTP %d\n", code);
     http.end();
     return false;
   }
+  // Respon = array [{document:{name,fields},readTime}, ...]; koleksi kosong ->
+  // item tanpa key "document". Filter: hanya name + fields yang masuk heap.
   JsonDocument filter;
-  filter["documents"][0]["name"] = true;
-  filter["documents"][0]["fields"] = true;
+  filter[0]["document"]["name"] = true;
+  filter[0]["document"]["fields"] = true;
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
   http.end();
@@ -790,7 +806,9 @@ bool fbRebuildCache() {
 
   JsonDocument outDoc;
   JsonArray arr = outDoc.to<JsonArray>();
-  for (JsonObject docu : doc["documents"].as<JsonArray>()) {
+  for (JsonObject item : doc.as<JsonArray>()) {
+    JsonObject docu = item["document"];
+    if (docu.isNull()) continue;          // entri readTime-only (koleksi kosong)
     JsonObject fl = docu["fields"];
     String name = docu["name"].as<String>();          // projects/.../documents/logs/<docId>
     JsonObject o = arr.add<JsonObject>();
@@ -830,31 +848,38 @@ bool fbEditLog(const String& docId, const String& vehicle, const String& plate) 
   return fsRequest("PATCH", url, body) == 200;
 }
 
-// Hapus semua dokumen koleksi: list nama (filter, hemat RAM) lalu DELETE satu-satu.
+// Hapus semua dokumen koleksi: runQuery nama dokumen (select __name__, hemat RAM)
+// lalu DELETE satu per satu, diulang sampai koleksi kosong.
 bool fbDeleteAll() {
   for (int round = 0; round < 10; round++) {
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
     http.useHTTP10(true);
-    if (!http.begin(client, fsBaseUrl() + "?pageSize=50")) return false;
+    if (!http.begin(client, fsQueryUrl())) return false;
     http.addHeader("Authorization", String("Bearer ") + fbToken);
+    http.addHeader("Content-Type", "application/json");
     http.setTimeout(15000);
-    if (http.GET() != 200) { http.end(); return false; }
+    String q = "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"" FS_COLLECTION "\"}],"
+               "\"select\":{\"fields\":[{\"fieldPath\":\"__name__\"}]},\"limit\":50}}";
+    if (http.POST(q) != 200) { http.end(); return false; }
     JsonDocument filter;
-    filter["documents"][0]["name"] = true;
+    filter[0]["document"]["name"] = true;
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
     http.end();
     if (err) return false;
-    JsonArray docs = doc["documents"].as<JsonArray>();
-    if (docs.isNull() || docs.size() == 0) return true;   // koleksi kosong -> selesai
-    for (JsonObject docu : docs) {
+    int deleted = 0;
+    for (JsonObject item : doc.as<JsonArray>()) {
+      JsonObject docu = item["document"];
+      if (docu.isNull()) continue;
       String name = docu["name"].as<String>();
       String docId = name.substring(name.lastIndexOf('/') + 1);
       fsRequest("DELETE", fsBaseUrl() + "/" + docId, "");
+      deleted++;
       vTaskDelay(pdMS_TO_TICKS(20));
     }
+    if (deleted == 0) return true;   // koleksi kosong -> selesai
   }
   return true;
 }
