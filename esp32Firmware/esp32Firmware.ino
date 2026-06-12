@@ -77,10 +77,10 @@ const char* WIFI_PASS = "20517420";
 //                   lalu Users -> Add user
 //   Firestore     : Build -> Firestore Database -> Create database,
 //                   Rules: allow read, write: if request.auth != null;
-#define FB_API_KEY    "GANTI_DENGAN_WEB_API_KEY"
-#define FB_PROJECT_ID "GANTI_DENGAN_PROJECT_ID"
-#define FB_EMAIL      "esp32@knalpot.local"
-#define FB_PASSWORD   "GANTI_PASSWORD"
+#define FB_API_KEY    "AIzaSyA_eSYwlhtGTVbXZ5QJ6GlNKLeQfm5esRo"
+#define FB_PROJECT_ID "bayulogdatabase"
+#define FB_EMAIL      "admin@gmail.com"
+#define FB_PASSWORD   "admin123"
 #define FS_COLLECTION "logs"     // nama koleksi Firestore untuk data log
 #define FS_PAGE_SIZE  20         // jumlah log terbaru yang di-cache (hemat RAM)
 
