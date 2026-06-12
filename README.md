@@ -115,8 +115,14 @@ bayu_knalpotSystem/
 
 1. Buka `esp32Firmware/esp32Firmware.ino` di Arduino IDE.
 2. Pilih board: **Tools → Board → ESP32 Dev Module**.
-3. Partition Scheme: **Default 4MB with spiffs** (atau apa pun yang punya partisi SPIFFS/LittleFS ≥ 1MB).
+3. Partition Scheme: **No OTA (2MB APP/2MB SPIFFS)** — **WAJIB**: firmware >1.3MB
+   (TLS/HTTPS untuk Firebase) sehingga tidak muat di skema default 1.25MB.
+   Error `text section exceeds available space` = partition scheme belum diganti.
 4. Tekan **Upload**.
+
+> Layout LittleFS ikut berubah pada skema ini: partisi data di offset `0x210000`
+> ukuran `0x1E0000` (build image: `mklittlefs -p 256 -b 4096 -s 0x1E0000`,
+> flash: `esptool write-flash 0x210000 littlefs.bin`).
 
 ### 4.2 Upload Web Assets ke LittleFS
 
