@@ -41,7 +41,7 @@ ESP32 DevKit V1
 │ GPIO  2 ─── TFT DC                      │
 │ GPIO  4 ─── TFT RST                     │
 │ GPIO 15 ─── Touch T_CS                  │
-│ GPIO 26 ─── SD Card CS (share SPI bus)  │
+│ GPIO 26 ─── SD CS (slot tidak dipakai)  │
 │ GPIO 34 ─── MQ-7 (CO)  ── via R1/R2 ──┐ │
 │ GPIO 35 ─── MQ-2 (HC)  ── via R1/R2 ──┤ │
 └────────────────────────────────────────┘
@@ -192,21 +192,43 @@ Tap **layar TFT** atau klik **web** — keduanya sinkron. Pilih index dari TFT a
 
 Klik **Simpan Settings** → semua tersimpan di NVS, bertahan setelah reboot.
 
-### 5.5 Tab Log (Data Logger)
+### 5.5 Tab Log (Data Logger — Firebase Firestore)
 
-Setiap hasil pengujian (state RESULT) otomatis **dicatat ke SD card** sebagai 1 baris JSON di file `/logs.jsonl`. Setiap entri berisi:
+Setiap hasil pengujian (state RESULT) otomatis **diupload ke Firebase Firestore** (koleksi `logs`, 1 dokumen per pengujian) lewat **REST API murni** — tanpa library Firebase, hanya `HTTPClient` + `WiFiClientSecure` + `ArduinoJson`. Setiap dokumen berisi:
 
-- `ts`: timestamp (NTP, format ISO 8601 WIB)
+- `ts`: timestamp (NTP, format ISO 8601 WIB) + `created` (epoch, kunci urutan)
+- `vehicle`, `plate`: data kendaraan (diedit dari web)
 - `idx_label`, `th_hc`, `th_co`: index motor & threshold yang dipakai
 - `avg_hc`, `avg_co`, `label`, `code`: ringkasan hasil
 - `s_hc[]`, `s_co[]`: array nilai sample HC/CO selama tahap SAMPLING (untuk replay grafik)
 
 Di tab Log, web menampilkan:
-- **Tabel riwayat** (terbaru di atas) — kolom: ID, Waktu, Index, AVG HC, AVG CO, Hasil
-- Tombol **Refresh**, **Download** (file `.jsonl` mentah untuk backup), **Hapus Semua**
-- Klik **Detail** → modal dengan grafik per-sample HC & CO (Chart.js)
+- **Tabel riwayat** (terbaru di atas, maks `FS_PAGE_SIZE` = 20 entri ter-cache) — kolom: #, Waktu, Kendaraan, Plat, Kategori, AVG HC, AVG CO, Hasil
+- Tombol **Refresh**, **Download** (export JSON), **Hapus Semua**
+- Klik **Detail** → modal dengan grafik per-sample HC & CO (Chart.js) + form edit kendaraan/plat
 
-Saat siklus pengujian selesai dan tab Log dibuka, tabel otomatis refresh setelah ~700ms (memberi waktu firmware menulis ke SD).
+Alur data: ESP32 meng-cache daftar log di RAM (`logsCache`, diisi `fbTask`); web hanya membaca cache via `/api/logs` — cepat dan tidak membebani Firestore. Setelah save/edit/hapus selesai di Firebase, ESP32 mengirim frame WS `logs_updated` dan tabel web refresh otomatis.
+
+#### Setup Firebase (sekali saja, di Firebase Console)
+
+1. Buat project di https://console.firebase.google.com
+2. **Build → Firestore Database → Create database** (mode production)
+3. **Rules** Firestore:
+   ```
+   rules_version = '2';
+   service cloud.firestore {
+     match /databases/{database}/documents {
+       match /{document=**} {
+         allow read, write: if request.auth != null;
+       }
+     }
+   }
+   ```
+4. **Authentication → Sign-in method**: aktifkan **Email/Password**, lalu **Users → Add user** (email & password untuk ESP32)
+5. Salin ke firmware (`esp32Firmware.ino` bagian `FIREBASE`):
+   - `FB_API_KEY` ← Project Settings → General → **Web API Key**
+   - `FB_PROJECT_ID` ← Project Settings → General → **Project ID**
+   - `FB_EMAIL` / `FB_PASSWORD` ← user yang dibuat di langkah 4
 
 ### 5.6 Tab Info
 
@@ -305,11 +327,11 @@ Threshold diambil dari **index yang dipilih user** (dinamis di Settings).
 | `/` | GET | `index.html` dari LittleFS |
 | `/api/settings` | GET | JSON konfigurasi lengkap |
 | `/api/settings` | POST | JSON (sebagian field OK) → simpan |
-| `/api/status` | GET | snapshot state + sensor + sistem (termasuk `sd_ok`) |
-| `/api/logs` | GET | array ringkasan log (untuk tabel) |
-| `/api/log?id=N` | GET | detail satu log (termasuk array sample) |
-| `/api/logs` | DELETE | hapus semua log |
-| `/api/logs/download` | GET | unduh file JSONL mentah (backup) |
+| `/api/status` | GET | snapshot state + sensor + sistem (termasuk `fb_ok`, `log_state`) |
+| `/api/logs` | GET | array log lengkap dari cache RAM (termasuk samples — dipakai tabel & modal detail) |
+| `/api/log/edit?id=<docId>` | POST | `{vehicle, plate}` → antrikan PATCH Firestore, respon instan `{ok,queued}` |
+| `/api/logs` | DELETE | antrikan hapus semua dokumen Firestore |
+| `/api/logs/download` | GET | export cache log sebagai file JSON |
 
 #### Contoh `/api/settings`:
 ```json
@@ -361,22 +383,22 @@ memblokir task lain** (akar dari semua bug restart/macet sebelumnya):
 ```
 CORE 1 — loopTask (realtime, tidak pernah blok):
   sensor ADC → Kalman → state machine → buzzer → TFT + touch → broadcast WS
-  → kalibrasi non-blocking. TIDAK PERNAH menyentuh SD card.
+  → kalibrasi non-blocking. TIDAK PERNAH melakukan HTTP.
 
-CORE 0 — sdTask (worker I/O, satu-satunya penulis SD):
-  antrian job (FreeRTOS queue): SDJOB_SAVE (simpan log run), SDJOB_REBUILD
-  (bangun ulang cache daftar log). Hasil simpan dilaporkan balik ke loopTask
-  (frame WS "log_saved") — kartu hasil web menampilkan ✓/✗.
+CORE 0 — fbTask (worker jaringan, satu-satunya yang bicara ke Firebase):
+  antrian job (FreeRTOS queue): FBJOB_SAVE (upload log run ke Firestore),
+  FBJOB_REBUILD (sync cache daftar log), FBJOB_EDIT (PATCH vehicle/plate),
+  FBJOB_DELETE_ALL. Auth idToken (~1 jam) di-refresh otomatis sebelum job.
+  Hasil dilaporkan balik ke loopTask (frame WS "log_saved"/"logs_updated").
 
 async_tcp (HTTP + WebSocket, task watchdog 5 detik):
-  tidak pernah I/O lama. GET /api/logs dilayani CACHE RAM; operasi ringan
-  (detail/edit/hapus) inline dengan ioLock timeout + batas waktu baca 3 detik.
+  tidak pernah I/O lama. GET /api/logs dilayani CACHE RAM; edit/hapus hanya
+  MENGANTRIKAN job ke fbTask lalu respon instan.
 ```
 
-Sinkronisasi: **satu mutex `ioMutex`** (bus SPI TFT/touch/SD + `logsCache`),
-tidak pernah nested → bebas deadlock. TFT/touch memakai **try-lock 25ms**:
-kalau sdTask sedang menulis, frame TFT di-skip dan dicoba lagi ~20ms kemudian —
-state machine, sensor, dan web tetap berjalan normal.
+Sinkronisasi: **satu mutex `ioMutex`** (bus SPI TFT/touch + `logsCache`),
+tidak pernah nested → bebas deadlock. HTTPS bisa makan waktu detik — karena
+semuanya di fbTask, state machine, TFT, dan web tidak pernah ikut menunggu.
 
 ### 9.1 Non-Blocking Loop
 
@@ -386,15 +408,15 @@ void loop() {
   if (now - lastSensorRead > 200) { readSensors(); chartPush(...); }
   // 2) kalibrasi non-blocking (no-op jika tidak aktif)
   calibTick();
-  // 3) cek touch (try-lock SPI; skip jika sdTask sedang pakai bus)
+  // 3) cek touch (try-lock)
   if (ioLock(25)) { if (getTouch(&tx, &ty)) dispatchTouch(tx, ty); ioUnlock(); }
-  // 4) advance state machine (RESULT -> enqueue job simpan ke sdTask)
+  // 4) advance state machine (RESULT -> enqueue job upload ke fbTask)
   tickStateMachine();
   // 5) update buzzer (millis-based)
   handleBuzzer();
   // 6) refresh TFT (partial update, try-lock)
   if (ioLock(25)) { tftRefresh(); ioUnlock(); }
-  // 7) lapor hasil simpan log dari sdTask (frame WS "log_saved")
+  // 7) lapor hasil dari fbTask (frame WS "log_saved" / "logs_updated")
   if (logSaveNotify) { ... wsSend(...); }
   // 8) broadcast WS tiap 200ms
   if (now - lastBroadcast > 200) broadcastData();
@@ -439,8 +461,9 @@ ESPAsyncWebServer punya antrian per-client (`WS_MAX_QUEUED_MESSAGES`, default 32
 |---|---|---|
 | TFT layar putih / hitam | Pin SPI salah / library tidak match | Cek wiring, pastikan rotation 1, library Adafruit_ILI9341 |
 | TFT putih setelah disentuh | Clash transaksi SPI touch vs TFT (bus dibagi) + clock TFT terlalu tinggi | Sudah di-mitigasi: (1) touch tidak gambar langsung, (2) `TFT_SPI_HZ`=16MHz, (3) touch di-throttle `TOUCH_POLL_MS`=40ms + jeda settle, (4) flush pakai partial redraw. Jika MASIH putih: turunkan `TFT_SPI_HZ` ke `10000000` |
-| Restart `task_wdt: async_tcp` | Handler HTTP blocking >5 detik (task watchdog): kalibrasi blocking, atau akses SD wedged dari handler (tab Log auto-refresh 3 detik bisa memicu restart loop) | Sudah di-fix dengan arsitektur dual-core (§9.0): kalibrasi non-blocking via `calibTick()`; semua tulis SD di `sdTask` core 0; `GET /api/logs` dari cache RAM; akses SD inline di handler diserialisasi `ioMutex` + batas waktu 3 detik. Jangan pernah `delay()` panjang atau I/O lambat di handler AsyncWebServer |
-| System run macet di INHALE / TFT tidak respon | Operasi SD lambat (kartu wedged) dulu dikerjakan di `loop()` → state machine & touch ikut tertahan | Sudah di-fix: simpan log & rebuild cache pindah ke `sdTask` (core 0); `loop()` (core 1) tidak pernah menyentuh SD; TFT pakai try-lock (skip frame, tidak menunggu) |
+| Restart `task_wdt: async_tcp` | Handler HTTP blocking >5 detik (task watchdog): kalibrasi blocking / I/O lama di handler | Sudah di-fix dengan arsitektur dual-core (§9.0): kalibrasi non-blocking via `calibTick()`; semua HTTP Firebase di `fbTask` core 0; `GET /api/logs` dari cache RAM. Jangan pernah `delay()` panjang atau I/O lambat di handler AsyncWebServer |
+| Log gagal tersimpan (✗ di kartu hasil) | WiFi tanpa internet / kredensial Firebase salah / rules menolak | Cek serial `[FB] auth ...` & `[LOG] ...`. Pastikan `FB_API_KEY`/`FB_PROJECT_ID`/`FB_EMAIL`/`FB_PASSWORD` benar, Email/Password sign-in aktif, rules Firestore `request.auth != null` |
+| Tab Log kosong / "Firebase tidak terhubung" | Auth belum sukses (`fb_ok=false`) | Sama seperti di atas; lihat juga `GET /api/status` field `fb_ok` |
 | Touch tidak responsif | T_CS tidak tersambung / kalibrasi salah | Sambungkan T_CS ke GPIO 15. Kalibrasi ulang di `TOUCH_XMIN`..`TOUCH_YMAX` |
 | Touch koordinat meleset | Default calibration tidak match TFT Anda | Print `p.x, p.y` mentah saat tap pojok layar, update define |
 | Tombol ke-tekan berulang / hang saat ditahan | Tanpa edge-detection touch akan retrigger | Sudah di-fix: `getTouch()` pakai edge-detection (1 aksi per tekan, wajib lepas dulu). Atur `TOUCH_DEBOUNCE` / `TOUCH_PRESS_MIN` bila perlu |
@@ -504,7 +527,12 @@ ts.setRotation(1);
 
 ---
 
-## 10.2 Known Issue — SD Card FAIL di Shared SPI
+## 10.2 Known Issue — SD Card FAIL di Shared SPI (HISTORIS)
+
+> **Catatan:** penyimpanan log sudah **dimigrasi ke Firebase Firestore** — SD card
+> tidak dipakai lagi (slot SD modul TFT dibiarkan kosong, `SD_CS` tetap HIGH agar
+> tidak mengganggu bus). Bagian ini dipertahankan sebagai dokumentasi riwayat
+> pengembangan & pembelajaran shared-SPI.
 
 ### Gejala
 Serial log menampilkan `SD FAIL` saat boot meskipun kartu terpasang.

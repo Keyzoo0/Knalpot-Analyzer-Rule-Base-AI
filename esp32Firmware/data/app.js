@@ -201,9 +201,10 @@ function handleMsg(m) {
     calibDone(m);
   } else if (m.type === 'log_saved') {
     updateLogSaveNote(m.ok ? 1 : 0);
-    // entry baru sudah masuk cache -> refresh tabel jika tab Log terbuka
-    if (m.ok && document.getElementById('tab-log').classList.contains('active')) {
-      setTimeout(() => fetchLogs && fetchLogs(), 500);
+  } else if (m.type === 'logs_updated') {
+    // cache daftar log di ESP32 baru di-sync dari Firestore -> refresh tabel
+    if (document.getElementById('tab-log').classList.contains('active')) {
+      fetchLogs && fetchLogs();
     }
   }
 }
@@ -279,13 +280,13 @@ function updateLogSaveNote(st) {
     hero.appendChild(note);
   }
   if (st === 2) {
-    note.textContent = '💾 Menyimpan ke data log (SD card)...';
+    note.textContent = '☁️ Menyimpan ke data log (Firebase)...';
     note.style.color = 'rgba(255,255,255,0.85)';
   } else if (st === 1) {
-    note.textContent = '✓ Tersimpan di data log (SD card)';
+    note.textContent = '✓ Tersimpan di data log (Firebase)';
     note.style.color = 'rgba(255,255,255,0.9)';
   } else if (st === 0) {
-    note.textContent = '✗ GAGAL simpan ke SD card — cek kartu SD!';
+    note.textContent = '✗ GAGAL simpan ke Firebase — cek internet/kredensial!';
     note.style.color = '#fde047';
   } else {
     note.textContent = '';
@@ -520,6 +521,8 @@ const RESULT_BADGES = [
   { bg:'bg-red-100',     tx:'text-red-700'     },  // 3 tidak normal
 ];
 
+let logsData = [];   // cache daftar log dari ESP32 (sudah lengkap, termasuk samples)
+
 async function fetchLogs(){
   const body = document.getElementById('logBody');
   body.innerHTML = '<tr><td colspan="9" class="text-center py-6 text-ink-400">Memuat...</td></tr>';
@@ -531,24 +534,25 @@ async function fetchLogs(){
       let err = '';
       try { err = (await r.json()).err || ''; } catch (_) {}
       if (err === 'busy') {
-        // SD sedang dipakai task lain (transient) — auto-refresh akan retry
+        // cache sedang di-update fbTask (transient) — auto-refresh akan retry
         document.getElementById('logCount').textContent = '— sibuk, mencoba lagi...';
         return;
       }
       document.getElementById('logSdWarn').classList.remove('hidden');
       body.innerHTML = '';
-      document.getElementById('logCount').textContent = '— SD tidak aktif';
+      document.getElementById('logCount').textContent = '— Firebase tidak terhubung';
       return;
     }
     const arr = await r.json();
+    logsData = arr;
     document.getElementById('logCount').textContent = `${arr.length} entri`;
     body.innerHTML = '';
     if (arr.length === 0) {
       document.getElementById('logEmpty').classList.remove('hidden');
       return;
     }
-    // tampilkan terbaru di atas
-    arr.slice().reverse().forEach(e => {
+    // urutan dari server sudah terbaru -> terlama (orderBy created desc)
+    arr.forEach((e, i) => {
       const bg = RESULT_BADGES[e.code]?.bg || 'bg-ink-100';
       const tx = RESULT_BADGES[e.code]?.tx || 'text-ink-700';
       const tr = document.createElement('tr');
@@ -556,7 +560,7 @@ async function fetchLogs(){
       const vehicle = (e.vehicle || '').trim();
       const plate   = (e.plate || '').trim();
       tr.innerHTML = `
-        <td class="px-3 py-2 mono text-ink-400">#${e.id}</td>
+        <td class="px-3 py-2 mono text-ink-400">#${arr.length - i}</td>
         <td class="px-3 py-2 mono text-xs">${e.ts || '-'}</td>
         <td class="px-3 py-2">${vehicle ? escapeHtml(vehicle) : '<span class="text-ink-300 italic">—</span>'}</td>
         <td class="px-3 py-2 mono uppercase">${plate ? escapeHtml(plate) : '<span class="text-ink-300 italic">—</span>'}</td>
@@ -565,7 +569,7 @@ async function fetchLogs(){
         <td class="px-3 py-2 mono text-right">${(+e.avg_co).toFixed(2)}</td>
         <td class="px-3 py-2"><span class="inline-block px-2 py-0.5 rounded text-xs font-semibold ${bg} ${tx}">${escapeHtml(e.label || '-')}</span></td>
         <td class="px-3 py-2 text-right">
-          <button data-detail="${e.id}" class="inline-flex items-center gap-1 px-2 py-1 rounded bg-blue-50 hover:bg-blue-100 text-blue-700 text-xs font-semibold">
+          <button data-detail="${i}" class="inline-flex items-center gap-1 px-2 py-1 rounded bg-blue-50 hover:bg-blue-100 text-blue-700 text-xs font-semibold">
             Detail
           </button>
         </td>`;
@@ -583,21 +587,22 @@ function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-let logEditId = null;   // id entry yang sedang dibuka di modal detail
+let logEditId = null;   // docId Firestore entry yang sedang dibuka di modal detail
 
-async function openLogDetail(id){
+// Detail diambil dari logsData (cache /api/logs sudah lengkap, termasuk samples) —
+// tidak ada request tambahan ke ESP32/Firestore.
+function openLogDetail(i){
   try {
-    const r = await fetch('/api/log?id=' + id);
-    if (!r.ok) return alert('Log tidak ditemukan');
-    const d = await r.json();
-    logEditId = id;
+    const d = logsData[i];
+    if (!d) return alert('Log tidak ditemukan');
+    logEditId = d.id;   // docId Firestore
     document.getElementById('logDetailTitle').textContent = d.label || '-';
     document.getElementById('logDetailMeta').textContent =
-      `${d.ts || '-'}  ·  ${d.idx_label || '-'}  ·  ${d.n} sample`;
+      `${d.ts || '-'}  ·  ${d.idx || '-'}  ·  ${d.n} sample`;
     // Form data kendaraan (editable)
     document.getElementById('logEditVehicle').value = d.vehicle || '';
     document.getElementById('logEditPlate').value   = d.plate || '';
-    document.getElementById('logEditKategori').textContent = d.idx_label || '-';
+    document.getElementById('logEditKategori').textContent = d.idx || '-';
     document.getElementById('logMetaMsg').textContent = '';
     document.getElementById('logDetailHC').textContent = (+d.avg_hc).toFixed(1);
     document.getElementById('logDetailCO').textContent = (+d.avg_co).toFixed(2);
@@ -645,15 +650,16 @@ document.getElementById('btnLogSaveMeta').addEventListener('click', async () => 
   msg.textContent = 'Menyimpan...';
   msg.className = 'text-sm font-medium text-amber-700';
   try {
-    const r = await fetch('/api/log/edit?id=' + logEditId, {
+    const r = await fetch('/api/log/edit?id=' + encodeURIComponent(logEditId), {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ vehicle, plate })
     });
     const j = await r.json();
     if (j.ok) {
-      msg.textContent = '✓ Tersimpan';
+      msg.textContent = '✓ Tersimpan (sinkronisasi Firebase...)';
       msg.className = 'text-sm font-medium text-emerald-600';
-      fetchLogs();   // refresh tabel agar kolom kendaraan/plat update
+      // tabel di-refresh saat frame WS "logs_updated"; fallback kalau frame drop:
+      setTimeout(fetchLogs, 4000);
     } else {
       msg.textContent = '✗ ' + (j.err || 'gagal');
       msg.className = 'text-sm font-medium text-red-600';
@@ -668,10 +674,15 @@ document.getElementById('btnLogSaveMeta').addEventListener('click', async () => 
 });
 document.getElementById('btnLogRefresh').addEventListener('click', fetchLogs);
 document.getElementById('btnLogClear').addEventListener('click', async () => {
-  if (!confirm('Hapus SEMUA log? Aksi ini tidak bisa dibatalkan.')) return;
+  if (!confirm('Hapus SEMUA log di Firebase? Aksi ini tidak bisa dibatalkan.')) return;
   const r = await fetch('/api/logs', { method: 'DELETE' });
-  if (r.ok) fetchLogs();
-  else alert('Gagal menghapus');
+  if (r.ok) {
+    document.getElementById('logCount').textContent = '— menghapus di Firebase...';
+    // tabel refresh saat frame WS "logs_updated"; fallback kalau frame drop:
+    setTimeout(fetchLogs, 6000);
+  } else {
+    alert('Gagal menghapus');
+  }
 });
 
 // (Auto-refresh log saat RESULT sudah di-hook dari handleMsg() di atas.)
@@ -703,7 +714,7 @@ async function fetchInfo(){
     setOk('infoMq7', s.mq7_ok, s.mq7_ok ? 'OK' : 'DISCONNECTED');
     setOk('infoMotor', true, s.motor ? 'ACTIVE' : 'IDLE');
     setOk('infoTft', s.tft_ok, s.tft_ok ? 'OK' : 'FAIL');
-    setOk('infoSd', !!s.sd_ok, s.sd_ok ? 'OK' : 'NO CARD');
+    setOk('infoSd', !!s.fb_ok, s.fb_ok ? 'CONNECTED' : 'OFFLINE');
     document.getElementById('infoHeap').textContent = (s.heap/1024).toFixed(1) + ' KB';
     const up = Math.floor(s.uptime_ms/1000);
     const h = Math.floor(up/3600), m = Math.floor((up%3600)/60), se = up%60;

@@ -6,8 +6,9 @@
   - Motor (relay)  -> GPIO 14 (active HIGH)
   - TFT ILI9341    -> SCK 18, MISO 19, MOSI 23, CS 5, DC 2, RST 4
   - Touch XPT2046  -> share SPI bus, T_CS 15 (T_IRQ tidak dipakai)
+  - Data log       -> Firebase Firestore via REST API (tanpa library Firebase)
   Libraries (install via Arduino Library Manager):
-    WiFi, Preferences, LittleFS, SPI, ESPmDNS
+    WiFi, Preferences, LittleFS, SPI, ESPmDNS, HTTPClient, WiFiClientSecure
     Adafruit_GFX, Adafruit_ILI9341
     XPT2046_Touchscreen (by Paul Stoffregen)
     ESPAsyncWebServer, AsyncTCP, ArduinoJson
@@ -17,8 +18,9 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <LittleFS.h>
-#include <SD.h>
 #include <SPI.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <time.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
@@ -41,7 +43,8 @@
 #define TFT_DC        2
 #define TFT_RST       4
 #define TOUCH_CS     15
-#define SD_CS        26   // SD card di modul TFT, share SCK/MISO/MOSI dengan TFT/touch
+#define SD_CS        26   // slot SD di modul TFT — TIDAK dipakai lagi (log ke Firestore),
+                          // tapi CS tetap di-set HIGH supaya tidak mengganggu bus SPI
 
 // Touch calibration (sesuaikan jika perlu — angka dari kode referensi)
 #define TOUCH_XMIN   675
@@ -62,8 +65,24 @@
 #define TOUCH_POLL_MS   15
 
 // ---------------- WIFI ----------------
-const char* WIFI_SSID = "Biznet";
-const char* WIFI_PASS = "12345678";
+const char* WIFI_SSID = "ROSI1";
+const char* WIFI_PASS = "20517420";
+
+// ---------------- FIREBASE (Firestore via REST API) ----------------
+// Tanpa library Firebase — pakai HTTPClient + ArduinoJson saja.
+// Cara mendapatkan nilai-nilai ini (Firebase Console):
+//   FB_API_KEY    : Project Settings -> General -> Web API Key
+//   FB_PROJECT_ID : Project Settings -> General -> Project ID
+//   FB_EMAIL/PASS : Authentication -> Sign-in method: aktifkan Email/Password,
+//                   lalu Users -> Add user
+//   Firestore     : Build -> Firestore Database -> Create database,
+//                   Rules: allow read, write: if request.auth != null;
+#define FB_API_KEY    "GANTI_DENGAN_WEB_API_KEY"
+#define FB_PROJECT_ID "GANTI_DENGAN_PROJECT_ID"
+#define FB_EMAIL      "esp32@knalpot.local"
+#define FB_PASSWORD   "GANTI_PASSWORD"
+#define FS_COLLECTION "logs"     // nama koleksi Firestore untuk data log
+#define FS_PAGE_SIZE  20         // jumlah log terbaru yang di-cache (hemat RAM)
 
 // ---------------- ADC / Sensor constants ----------------
 // === Pembagi tegangan untuk turunkan Vout MQ (5V) ke level ADC ESP32 (3.3V) ===
@@ -174,29 +193,29 @@ uint32_t lastSampleAt = 0;
 float    sampleHC[MAX_SAMPLES];   // nilai per-sample saat SAMPLING (untuk log)
 float    sampleCO[MAX_SAMPLES];
 
-// SD card
-bool sd_ok = false;
-const char* LOG_PATH = "/logs.jsonl";   // JSON-lines: 1 baris = 1 log entry
-const char* LOG_TMP  = "/logs.tmp";     // file sementara saat rewrite (edit entry)
+// Firebase / penyimpanan log
+bool fb_ok = false;                     // true setelah auth Firebase pertama sukses
 
 // --- Arsitektur dual-core ---
 // Core 1 (loopTask)  : sensor ADC, state machine, buzzer, TFT + touch, broadcast WS,
-//                      kalibrasi non-blocking. TIDAK PERNAH menyentuh SD.
-// Core 0 (sdTask)    : SEMUA tulis SD (simpan log, rebuild cache) via antrian job.
+//                      kalibrasi non-blocking. TIDAK PERNAH melakukan HTTP.
+// Core 0 (fbTask)    : SEMUA komunikasi Firebase Firestore (auth, simpan log,
+//                      ambil daftar, edit, hapus) via antrian job — HTTPS bisa
+//                      makan waktu detik, haram di loopTask & async_tcp (WDT 5s).
 // async_tcp (HTTP/WS): tidak pernah I/O lama. /api/logs dilayani cache RAM;
-//                      operasi ringan (detail/edit/hapus) inline dengan lock
-//                      timeout pendek + batas waktu baca 3 detik (WDT = 5 detik).
-// ioMutex = SATU-SATUNYA lock: bus SPI (TFT/touch/SD) + logsCache. Tidak pernah
-// nested -> bebas deadlock. TFT/touch pakai try-lock singkat: kalau sdTask sedang
-// pegang bus, frame di-skip — state machine & web tetap jalan, tidak ada yang macet.
+//                      edit/hapus hanya MENGANTRIKAN job lalu respon instan.
+// ioMutex melindungi bus SPI (TFT/touch) + logsCache. Tidak pernah nested ->
+// bebas deadlock. TFT/touch pakai try-lock singkat (skip frame jika sibuk).
 SemaphoreHandle_t ioMutex = nullptr;
-QueueHandle_t sdQueue = nullptr;
-enum SdJobType : uint8_t { SDJOB_SAVE, SDJOB_REBUILD };
-struct SdJob { SdJobType type; String* payload; };   // payload di-delete oleh sdTask
-String logsCache = "[]";                // cache ringkasan log utk GET /api/logs
+QueueHandle_t fbQueue = nullptr;
+enum FbJobType : uint8_t { FBJOB_SAVE, FBJOB_REBUILD, FBJOB_EDIT, FBJOB_DELETE_ALL };
+// a/b/c milik penerima (di-delete fbTask): SAVE a=json entry; EDIT a=docId b=vehicle c=plate
+struct FbJob { FbJobType type; String* a; String* b; String* c; };
+String logsCache = "[]";                // cache daftar log utk GET /api/logs (full, termasuk samples)
 // Status simpan log run terakhir: -1 belum ada, 0 gagal, 1 tersimpan, 2 sedang menyimpan
 volatile int8_t logSaveState = -1;
-volatile bool   logSaveNotify = false;  // sdTask -> loop: kirim frame WS "log_saved"
+volatile bool   logSaveNotify = false;     // fbTask -> loop: kirim frame WS "log_saved"
+volatile bool   logsUpdatedNotify = false; // fbTask -> loop: frame WS "logs_updated" (refresh tabel)
 
 bool ioLock(uint32_t ms) { return ioMutex && xSemaphoreTake(ioMutex, pdMS_TO_TICKS(ms)) == pdTRUE; }
 void ioUnlock()          { if (ioMutex) xSemaphoreGive(ioMutex); }
@@ -579,7 +598,7 @@ void broadcastResult() {
   String s; serializeJson(d, s); wsSend(s);
 }
 
-// ---------------- NTP & Logger (SD card) ----------------
+// ---------------- NTP & timestamp ----------------
 String currentTimestamp() {
   struct tm ti;
   if (!getLocalTime(&ti, 50)) {
@@ -592,37 +611,123 @@ String currentTimestamp() {
   return String(b);
 }
 
-// Tulis 1 baris JSONL ke SD; return jumlah byte tertulis (0 = gagal).
-// HANYA dipanggil dari sdTask (sudah pegang ioMutex).
-// VERIFIKASI NYATA: f.print() bisa "sukses" walau kartu membuang data (kartu
-// palsu/rusak) — jadi ukuran file dicek sebelum & sesudah; harus bertambah.
-static size_t writeLogLine(const String& line) {
-  size_t before = 0;
-  { File c = SD.open(LOG_PATH, FILE_READ); if (c) { before = c.size(); c.close(); } }
-  File f = SD.open(LOG_PATH, FILE_APPEND);
-  if (!f) return 0;
-  size_t n = f.print(line);
-  if (n > 0) n += f.print('\n');
-  f.close();
-  size_t after = 0;
-  { File c = SD.open(LOG_PATH, FILE_READ); if (c) { after = c.size(); c.close(); } }
-  Serial.printf("[LOG] file %u -> %u bytes\n", (unsigned)before, (unsigned)after);
-  return (after > before) ? n : 0;
+// ============ Firebase Firestore via REST API (tanpa library Firebase) ============
+// Pola sama dengan panduan RTDB REST (HTTPClient + ArduinoJson), tapi endpoint
+// Firestore: https://firestore.googleapis.com/v1/projects/<PID>/databases/(default)/documents
+// Auth: Identity Toolkit signInWithPassword -> idToken, dikirim sebagai header
+// "Authorization: Bearer <token>" (Firestore tidak pakai ?auth= seperti RTDB).
+// SEMUA fungsi fb*/fs* di bawah HANYA dipanggil dari fbTask (core 0).
+
+String   fbToken = "";
+uint32_t fbTokenExpireAt = 0;   // deadline millis()
+
+bool fbTokenValid() {
+  // sisakan margin 60 detik sebelum expired
+  return fbToken.length() > 0 && (int32_t)(fbTokenExpireAt - millis()) > 60000;
 }
 
-// Siapkan 1 entry log lalu ANTRIKAN ke sdTask (core 0). Dipanggil dari state
-// machine (loopTask) saat masuk RESULT — tidak menyentuh SD sama sekali, jadi
-// state machine/TFT tidak pernah ikut macet kalau kartu SD bermasalah.
+// Login email+password -> idToken (berlaku ~1 jam)
+bool fbAuth() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure client;
+  client.setInsecure();   // sederhana utk proyek; produksi: setCACert(root_ca)
+  HTTPClient http;
+  String url = String("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=") + FB_API_KEY;
+  if (!http.begin(client, url)) return false;
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+  JsonDocument d;
+  d["email"] = FB_EMAIL;
+  d["password"] = FB_PASSWORD;
+  d["returnSecureToken"] = true;
+  String body; serializeJson(d, body);
+  int code = http.POST(body);
+  bool ok = false;
+  if (code == 200) {
+    JsonDocument filter;
+    filter["idToken"] = true;
+    filter["expiresIn"] = true;
+    JsonDocument r;
+    if (!deserializeJson(r, http.getString(), DeserializationOption::Filter(filter))) {
+      fbToken = r["idToken"].as<String>();
+      uint32_t expSec = String(r["expiresIn"] | "3600").toInt();
+      fbTokenExpireAt = millis() + expSec * 1000UL;
+      ok = fbToken.length() > 0;
+    }
+  } else {
+    Serial.printf("[FB] auth HTTP %d\n", code);
+  }
+  http.end();
+  if (ok) fb_ok = true;
+  Serial.printf("[FB] auth %s (heap=%u)\n", ok ? "OK" : "FAIL", ESP.getFreeHeap());
+  return ok;
+}
+
+bool fbEnsureAuth() { return fbTokenValid() ? true : fbAuth(); }
+
+String fsBaseUrl() {
+  return String("https://firestore.googleapis.com/v1/projects/") + FB_PROJECT_ID +
+         "/databases/(default)/documents/" + FS_COLLECTION;
+}
+
+// Request Firestore generik (POST/PATCH/DELETE) — respon kecil, body dibuang.
+int fsRequest(const char* method, const String& url, const String& body) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, url)) return -1;
+  http.addHeader("Authorization", String("Bearer ") + fbToken);
+  if (body.length()) http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+  int code = http.sendRequest(method, (uint8_t*)body.c_str(), body.length());
+  if (code != 200) {
+    Serial.printf("[FB] %s HTTP %d: %s\n", method, code, http.getString().substring(0, 120).c_str());
+  }
+  http.end();
+  return code;
+}
+
+// Konversi entry compact (internal) -> dokumen Firestore {"fields":{...}}.
+// Catatan format Firestore: integerValue HARUS string, doubleValue angka.
+static bool toFirestoreDoc(const String& entryJson, String& out) {
+  JsonDocument src;
+  if (deserializeJson(src, entryJson)) return false;
+  JsonDocument d;
+  JsonObject f = d["fields"].to<JsonObject>();
+  f["ts"]["stringValue"]        = src["ts"].as<String>();
+  f["created"]["integerValue"]  = String(src["created"].as<uint32_t>());  // epoch utk orderBy
+  f["up"]["integerValue"]       = String(src["up"].as<uint32_t>());
+  f["vehicle"]["stringValue"]   = src["vehicle"].as<String>();
+  f["plate"]["stringValue"]     = src["plate"].as<String>();
+  f["idx_label"]["stringValue"] = src["idx_label"].as<String>();
+  f["th_hc"]["doubleValue"]     = src["th_hc"].as<float>();
+  f["th_co"]["doubleValue"]     = src["th_co"].as<float>();
+  f["avg_hc"]["doubleValue"]    = src["avg_hc"].as<float>();
+  f["avg_co"]["doubleValue"]    = src["avg_co"].as<float>();
+  f["label"]["stringValue"]     = src["label"].as<String>();
+  f["code"]["integerValue"]     = String(src["code"].as<int>());
+  f["n"]["integerValue"]        = String(src["n"].as<int>());
+  JsonArray hv = f["s_hc"]["arrayValue"]["values"].to<JsonArray>();
+  for (JsonVariant v : src["s_hc"].as<JsonArray>()) hv.add<JsonObject>()["doubleValue"] = v.as<float>();
+  JsonArray cv = f["s_co"]["arrayValue"]["values"].to<JsonArray>();
+  for (JsonVariant v : src["s_co"].as<JsonArray>()) cv.add<JsonObject>()["doubleValue"] = v.as<float>();
+  serializeJson(d, out);
+  return true;
+}
+
+// Siapkan 1 entry log lalu ANTRIKAN ke fbTask (core 0). Dipanggil dari state
+// machine (loopTask) saat masuk RESULT — tidak melakukan HTTP sama sekali, jadi
+// state machine/TFT tidak pernah ikut macet kalau jaringan/Firebase bermasalah.
 void saveLogEntry() {
-  if (!sd_ok || !sdQueue) {
+  if (!fbQueue) {
     logSaveState = 0; logSaveNotify = true;
-    Serial.println("[LOG] SD not ready, skip");
     return;
   }
 
   JsonDocument d;
-  d["ts"]    = currentTimestamp();
-  d["up"]    = (uint32_t)(millis() / 1000);
+  d["ts"]      = currentTimestamp();
+  d["created"] = (uint32_t)time(nullptr);   // epoch detik — kunci urutan di Firestore
+  d["up"]      = (uint32_t)(millis() / 1000);
   d["vehicle"] = "";   // nama kendaraan — diisi/diedit dari web (TFT tanpa keyboard)
   d["plate"]   = "";   // nomor plat — diisi/diedit dari web
   d["idx_label"] = (selectedIndex>=0) ? cfg.indices[selectedIndex].label : String("?");
@@ -644,9 +749,9 @@ void saveLogEntry() {
 
   String* line = new String();
   serializeJson(d, *line);
-  SdJob job{SDJOB_SAVE, line};
-  if (xQueueSend(sdQueue, &job, 0) == pdTRUE) {
-    logSaveState = 2;   // pending — sdTask di core 0 yang menuntaskan
+  FbJob job{FBJOB_SAVE, line, nullptr, nullptr};
+  if (xQueueSend(fbQueue, &job, 0) == pdTRUE) {
+    logSaveState = 2;   // pending — fbTask di core 0 yang menuntaskan upload
   } else {
     delete line;
     logSaveState = 0; logSaveNotify = true;
@@ -654,169 +759,153 @@ void saveLogEntry() {
   }
 }
 
-// Edit metadata (vehicle & plate) 1 entry log berdasarkan id (= indeks baris).
-// Rewrite streaming baris-per-baris ke file temp lalu rename — hemat heap walau
-// log besar (tidak memuat seluruh file ke RAM, hanya 1 baris target yang di-parse).
-bool editLogEntry(int wantId, const String& vehicle, const String& plate) {
-  if (!sd_ok || !SD.exists(LOG_PATH)) return false;
-  File in = SD.open(LOG_PATH, FILE_READ);
-  if (!in) return false;
-  if (SD.exists(LOG_TMP)) SD.remove(LOG_TMP);
-  File out = SD.open(LOG_TMP, FILE_WRITE);
-  if (!out) { in.close(); return false; }
-
-  int id = 0;
-  bool edited = false;
-  uint32_t t0 = millis();
-  while (in.available()) {
-    // Batas waktu: dipanggil dari task async_tcp (WDT 5 detik). Kartu SD wedged
-    // membuat tiap baca timeout — lebih baik gagal daripada restart.
-    if (millis() - t0 > 3000) {
-      in.close(); out.close(); SD.remove(LOG_TMP);
-      Serial.println("[LOG] edit timeout (SD lambat)");
-      return false;
-    }
-    String line = in.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
-    if (id == wantId) {
-      JsonDocument d;
-      if (!deserializeJson(d, line)) {
-        d["vehicle"] = vehicle;
-        d["plate"]   = plate;
-        serializeJson(d, out);
-        edited = true;
-      } else {
-        out.print(line);   // baris korup: tulis apa adanya
-      }
-    } else {
-      out.print(line);
-    }
-    out.print('\n');
-    id++;
+// Ambil daftar log terbaru dari Firestore -> cache RAM (dipakai GET /api/logs
+// dan modal detail di web). Hemat RAM: respon Firestore yang verbose di-parse
+// streaming dengan filter (hanya field yang dibutuhkan yang masuk heap).
+bool fbRebuildCache() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.useHTTP10(true);   // matikan chunked encoding supaya stream bisa di-parse
+  String url = fsBaseUrl() + "?pageSize=" + String(FS_PAGE_SIZE) + "&orderBy=created%20desc";
+  if (!http.begin(client, url)) return false;
+  http.addHeader("Authorization", String("Bearer ") + fbToken);
+  http.setTimeout(15000);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[CACHE] list HTTP %d\n", code);
+    http.end();
+    return false;
   }
-  in.close();
-  out.close();
-  if (!edited) { SD.remove(LOG_TMP); return false; }
-  SD.remove(LOG_PATH);
-  return SD.rename(LOG_TMP, LOG_PATH);
-}
-
-// Bangun ulang cache ringkasan log. HANYA dipanggil dari sdTask (sudah pegang
-// ioMutex). GET /api/logs hanya membaca cache RAM ini.
-void rebuildLogsCache() {
-  if (!sd_ok) return;   // breaker aktif: biarkan cache lama tetap tampil
-  if (!SD.exists(LOG_PATH)) {
-    logsCache = "[]";
-    Serial.println("[CACHE] file log tidak ada -> []");
-    return;
+  JsonDocument filter;
+  filter["documents"][0]["name"] = true;
+  filter["documents"][0]["fields"] = true;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (err) {
+    Serial.printf("[CACHE] parse: %s\n", err.c_str());
+    return false;
   }
-  File f = SD.open(LOG_PATH, FILE_READ);
-  if (!f) { logsCache = "[]"; Serial.println("[CACHE] open fail -> []"); return; }
-  size_t fsize = f.size();
+
   JsonDocument outDoc;
   JsonArray arr = outDoc.to<JsonArray>();
-  int id = 0;
-  uint32_t t0 = millis();
-  size_t prevPos = (size_t)-1;
-  while (f.available()) {
-    // Kartu lambat/wedged: pakai sebagian saja, jangan tahan ioMutex kelamaan
-    if (millis() - t0 > 4000) break;
-    // Baca macet (posisi tidak maju) = cluster file rusak -> berhenti, jangan spin
-    if (f.position() == prevPos) {
-      Serial.println("[CACHE] baca macet — file log korup? (cek /logs.bad)");
-      break;
-    }
-    prevPos = f.position();
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
-    JsonDocument d;
-    if (deserializeJson(d, line)) { id++; continue; }
+  for (JsonObject docu : doc["documents"].as<JsonArray>()) {
+    JsonObject fl = docu["fields"];
+    String name = docu["name"].as<String>();          // projects/.../documents/logs/<docId>
     JsonObject o = arr.add<JsonObject>();
-    o["id"]      = id;
-    o["ts"]      = d["ts"].as<String>();
-    o["vehicle"] = d["vehicle"] | "";   // entry lama tanpa field -> string kosong
-    o["plate"]   = d["plate"]   | "";
-    o["idx"]    = d["idx_label"].as<String>();
-    o["avg_hc"] = d["avg_hc"].as<float>();
-    o["avg_co"] = d["avg_co"].as<float>();
-    o["code"]   = d["code"].as<int>();
-    o["label"]  = d["label"].as<String>();
-    o["n"]      = d["n"].as<int>();
-    id++;
-    if ((id & 0x07) == 0) vTaskDelay(1);   // napas utk IDLE0 tiap 8 baris (anti task_wdt)
+    o["id"]      = name.substring(name.lastIndexOf('/') + 1);
+    o["ts"]      = fl["ts"]["stringValue"]        | "";
+    o["vehicle"] = fl["vehicle"]["stringValue"]   | "";
+    o["plate"]   = fl["plate"]["stringValue"]     | "";
+    o["idx"]     = fl["idx_label"]["stringValue"] | "";
+    o["th_hc"]   = fl["th_hc"]["doubleValue"]  | 0.0f;
+    o["th_co"]   = fl["th_co"]["doubleValue"]  | 0.0f;
+    o["avg_hc"]  = fl["avg_hc"]["doubleValue"] | 0.0f;
+    o["avg_co"]  = fl["avg_co"]["doubleValue"] | 0.0f;
+    o["code"]    = atoi(fl["code"]["integerValue"] | "0");
+    o["n"]       = atoi(fl["n"]["integerValue"]    | "0");
+    o["label"]   = fl["label"]["stringValue"] | "";
+    JsonArray sh = o["s_hc"].to<JsonArray>();
+    for (JsonObject v : fl["s_hc"]["arrayValue"]["values"].as<JsonArray>()) sh.add(v["doubleValue"] | 0.0f);
+    JsonArray sc = o["s_co"].to<JsonArray>();
+    for (JsonObject v : fl["s_co"]["arrayValue"]["values"].as<JsonArray>()) sc.add(v["doubleValue"] | 0.0f);
   }
-  f.close();
-  logsCache = "";
-  serializeJson(outDoc, logsCache);
-  Serial.printf("[CACHE] rebuilt: %d entri (file=%u bytes)\n", (int)arr.size(), (unsigned)fsize);
+  String out;
+  serializeJson(outDoc, out);
+  if (ioLock(2000)) { logsCache = out; ioUnlock(); }
+  Serial.printf("[CACHE] rebuilt: %d entri dari Firestore (heap=%u)\n",
+                (int)arr.size(), ESP.getFreeHeap());
+  return true;
 }
 
-// Worker SD di CORE 0 — satu-satunya penulis SD card. Ambil job dari antrian,
-// pegang ioMutex selama operasi (TFT di core 1 cuma skip frame sebentar),
-// lalu lapor hasil ke loopTask via logSaveNotify.
-void sdTaskLoop(void*) {
-  SdJob job;
+// PATCH vehicle & plate satu dokumen (updateMask agar field lain tidak tertimpa)
+bool fbEditLog(const String& docId, const String& vehicle, const String& plate) {
+  JsonDocument d;
+  d["fields"]["vehicle"]["stringValue"] = vehicle;
+  d["fields"]["plate"]["stringValue"]   = plate;
+  String body; serializeJson(d, body);
+  String url = fsBaseUrl() + "/" + docId +
+               "?updateMask.fieldPaths=vehicle&updateMask.fieldPaths=plate";
+  return fsRequest("PATCH", url, body) == 200;
+}
+
+// Hapus semua dokumen koleksi: list nama (filter, hemat RAM) lalu DELETE satu-satu.
+bool fbDeleteAll() {
+  for (int round = 0; round < 10; round++) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.useHTTP10(true);
+    if (!http.begin(client, fsBaseUrl() + "?pageSize=50")) return false;
+    http.addHeader("Authorization", String("Bearer ") + fbToken);
+    http.setTimeout(15000);
+    if (http.GET() != 200) { http.end(); return false; }
+    JsonDocument filter;
+    filter["documents"][0]["name"] = true;
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+    http.end();
+    if (err) return false;
+    JsonArray docs = doc["documents"].as<JsonArray>();
+    if (docs.isNull() || docs.size() == 0) return true;   // koleksi kosong -> selesai
+    for (JsonObject docu : docs) {
+      String name = docu["name"].as<String>();
+      String docId = name.substring(name.lastIndexOf('/') + 1);
+      fsRequest("DELETE", fsBaseUrl() + "/" + docId, "");
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+  }
+  return true;
+}
+
+// Worker Firebase di CORE 0 — satu-satunya yang melakukan HTTP/HTTPS.
+// Ambil job dari antrian, pastikan WiFi + token, eksekusi, lapor ke loopTask.
+void fbTaskLoop(void*) {
+  FbJob job;
   for (;;) {
-    if (xQueueReceive(sdQueue, &job, portMAX_DELAY) != pdTRUE) continue;
-    if (job.type == SDJOB_SAVE) {
+    if (xQueueReceive(fbQueue, &job, portMAX_DELAY) != pdTRUE) continue;
+    bool ready = (WiFi.status() == WL_CONNECTED) && fbEnsureAuth();
+
+    if (job.type == FBJOB_SAVE) {
       bool ok = false;
-      bool attempted = false;
-      size_t n = 0;
-      if (ioLock(8000)) {
-        attempted = true;
-        n = writeLogLine(*job.payload);
-        if (n == 0) {
-          // Yield antar langkah: kartu sekarat membuat driver SD busy-spin lama.
-          // sdTask prio 1 > IDLE0 prio 0 -> tanpa jeda, IDLE0 (core 0) kelaparan
-          // >5 detik -> task_wdt -> restart. vTaskDelay memberi IDLE0 napas.
-          vTaskDelay(pdMS_TO_TICKS(20));
-          Serial.println("[LOG] write fail -> remount SD & retry...");
-          SD.end();
-          vTaskDelay(pdMS_TO_TICKS(50));
-          if (SD.begin(SD_CS, SPI, 4000000)) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-            n = writeLogLine(*job.payload);
-          } else {
-            Serial.println("[LOG] remount fail");
+      if (ready) {
+        String body;
+        if (toFirestoreDoc(*job.a, body)) {
+          ok = (fsRequest("POST", fsBaseUrl(), body) == 200);
+          if (!ok) {   // retry sekali: token/jaringan bisa baru saja pulih
+            vTaskDelay(pdMS_TO_TICKS(500));
+            if (fbAuth()) ok = (fsRequest("POST", fsBaseUrl(), body) == 200);
           }
         }
-        if (n == 0 && SD.exists(LOG_PATH)) {
-          // Kasus nyata di lapangan: file log lama menempati cluster rusak —
-          // append/baca ke file ITU gagal padahal file baru normal (self-test
-          // PASS). Karantina file korup, mulai file baru di cluster sehat.
-          Serial.println("[LOG] karantina file log korup -> /logs.bad");
-          SD.remove("/logs.bad");
-          SD.rename(LOG_PATH, "/logs.bad");
-          vTaskDelay(pdMS_TO_TICKS(20));
-          n = writeLogLine(*job.payload);
-        }
-        ok = (n > 0);
-        ioUnlock();
-      } else {
-        Serial.println("[LOG] SAVE FAIL: ioMutex timeout");
       }
-      delete job.payload;
-      if (!ok && attempted && sd_ok) {
-        // Circuit breaker: tulis terverifikasi gagal walau sudah remount+retry ->
-        // kartu memang tidak bisa dipakai. Matikan SD sampai restart supaya tiap
-        // operasi lambat tidak terus membebani bus & memancing WDT.
-        sd_ok = false;
-        Serial.println("[LOG] SD dinonaktifkan sampai restart (tulis gagal terverifikasi)");
-      }
+      delete job.a;
       logSaveState = ok ? 1 : 0;
       logSaveNotify = true;
-      Serial.printf("[LOG] %s (%u bytes)\n", ok ? "saved" : "SAVE FAIL", (unsigned)n);
+      Serial.printf("[LOG] %s (Firestore, heap=%u)\n", ok ? "saved" : "SAVE FAIL", ESP.getFreeHeap());
       if (ok) {
-        SdJob r{SDJOB_REBUILD, nullptr};
-        xQueueSend(sdQueue, &r, 0);   // refresh cache daftar log
+        FbJob r{FBJOB_REBUILD, nullptr, nullptr, nullptr};
+        xQueueSend(fbQueue, &r, 0);   // refresh cache daftar log
       }
-      vTaskDelay(pdMS_TO_TICKS(10));
-    } else if (job.type == SDJOB_REBUILD) {
-      if (ioLock(8000)) { rebuildLogsCache(); ioUnlock(); }
-      vTaskDelay(pdMS_TO_TICKS(10));
+    } else if (job.type == FBJOB_REBUILD) {
+      if (ready && fbRebuildCache()) logsUpdatedNotify = true;
+    } else if (job.type == FBJOB_EDIT) {
+      bool ok = ready && fbEditLog(*job.a, *job.b, *job.c);
+      delete job.a; delete job.b; delete job.c;
+      Serial.printf("[LOG] edit %s\n", ok ? "OK" : "FAIL");
+      if (ok) {
+        FbJob r{FBJOB_REBUILD, nullptr, nullptr, nullptr};
+        xQueueSend(fbQueue, &r, 0);
+      }
+    } else if (job.type == FBJOB_DELETE_ALL) {
+      bool ok = ready && fbDeleteAll();
+      Serial.printf("[LOG] delete-all %s\n", ok ? "OK" : "FAIL");
+      if (ok) {
+        if (ioLock(2000)) { logsCache = "[]"; ioUnlock(); }
+        logsUpdatedNotify = true;
+      }
     }
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
@@ -851,7 +940,7 @@ void enterState(SysState ns) {
       setMotor(false);
       classify();
       setBuzzerPattern(3); // long beep
-      saveLogEntry();      // antrikan ke sdTask (core 0); hasil via frame log_saved
+      saveLogEntry();      // antrikan ke fbTask (core 0); hasil via frame log_saved
       broadcastResult();
       break;
     case ST_IDLE:
@@ -1049,7 +1138,7 @@ void registerRoutes() {
     d["mq2_ok"] = mq2_ok;
     d["mq7_ok"] = mq7_ok;
     d["tft_ok"] = tft_ok;
-    d["sd_ok"] = sd_ok;
+    d["fb_ok"] = fb_ok;                   // auth Firebase pernah sukses
     d["log_state"] = (int)logSaveState;   // -1 belum ada, 0 gagal, 1 ok, 2 menyimpan
     d["rssi"] = WiFi.RSSI();
     d["ip"] = WiFi.localIP().toString();
@@ -1063,92 +1152,69 @@ void registerRoutes() {
     req->send(200, "application/json", s);
   });
 
-  // === LOG endpoints (SD card) ===
-  // ATURAN: handler ini jalan di task async_tcp (task watchdog 5 detik) — tidak
-  // boleh blocking lama di SD. Daftar log dilayani dari cache RAM; operasi SD
-  // langsung selalu pakai ioLock timeout pendek + batas waktu loop baca.
+  // === LOG endpoints (Firebase Firestore) ===
+  // ATURAN: handler jalan di task async_tcp (task watchdog 5 detik) — TIDAK boleh
+  // melakukan HTTP. Daftar log dilayani CACHE RAM (diisi fbTask); edit/hapus
+  // hanya MENGANTRIKAN job ke fbTask lalu respon instan. Detail entry tidak
+  // butuh endpoint: cache sudah berisi data lengkap (termasuk samples).
 
-  // GET /api/logs/download -> raw JSONL. HARUS didaftarkan SEBELUM "/api/logs":
-  // ESPAsyncWebServer mencocokkan prefix ("/api/logs" menangkap "/api/logs/..."),
-  // jadi kalau terbalik, download dibajak handler daftar (bug shadowing).
+  // GET /api/logs/download -> export cache sebagai file JSON.
+  // Didaftarkan SEBELUM "/api/logs" (ESPAsyncWebServer mencocokkan prefix).
   server.on("/api/logs/download", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (!sd_ok || !SD.exists(LOG_PATH)) { req->send(404, "text/plain", "no logs"); return; }
-    req->send(SD, LOG_PATH, "application/x-ndjson", true);
+    if (!fb_ok) { req->send(404, "text/plain", "no logs"); return; }
+    if (!ioLock(100)) { req->send(503, "text/plain", "busy"); return; }
+    String out = logsCache;
+    ioUnlock();
+    AsyncWebServerResponse* res = req->beginResponse(200, "application/json", out);
+    res->addHeader("Content-Disposition", "attachment; filename=logs.json");
+    req->send(res);
   });
 
-  // GET /api/logs        -> daftar ringkasan dari CACHE RAM (tanpa sentuh SD)
+  // GET /api/logs        -> daftar log lengkap dari CACHE RAM (tanpa HTTP)
   server.on("/api/logs", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (!sd_ok) { req->send(503, "application/json", "{\"err\":\"sd_not_ready\"}"); return; }
+    if (!fb_ok) { req->send(503, "application/json", "{\"err\":\"fb_not_ready\"}"); return; }
     if (!ioLock(100)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
     String out = logsCache;   // copy singkat di dalam lock (hindari race dgn rebuild)
     ioUnlock();
     req->send(200, "application/json", out);
   });
 
-  // GET /api/log?id=N    -> detail lengkap satu log (termasuk samples)
-  server.on("/api/log", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (!sd_ok) { req->send(503, "application/json", "{\"err\":\"sd_not_ready\"}"); return; }
-    if (!req->hasParam("id")) { req->send(400, "application/json", "{\"err\":\"need_id\"}"); return; }
-    int wantId = req->getParam("id")->value().toInt();
-    if (!ioLock(500)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
-    File f = SD.open(LOG_PATH, FILE_READ);
-    if (!f) { ioUnlock(); req->send(404, "application/json", "{\"err\":\"no_log\"}"); return; }
-    int id = 0;
-    uint32_t t0 = millis();
-    while (f.available()) {
-      if (millis() - t0 > 3000) {   // SD lambat/wedged: gagal sebelum kena WDT
-        f.close(); ioUnlock();
-        req->send(504, "application/json", "{\"err\":\"sd_timeout\"}");
-        return;
-      }
-      String line = f.readStringUntil('\n');
-      line.trim();
-      if (line.length() == 0) continue;
-      if (id == wantId) {
-        f.close(); ioUnlock();
-        req->send(200, "application/json", line);
-        return;
-      }
-      id++;
-    }
-    f.close(); ioUnlock();
-    req->send(404, "application/json", "{\"err\":\"id_not_found\"}");
-  });
-
-  // POST /api/log/edit?id=N  body {vehicle, plate} -> edit metadata 1 entry
+  // POST /api/log/edit?id=<docId>  body {vehicle, plate} -> antrikan PATCH ke fbTask.
+  // Respon instan {"ok":true,"queued":true}; web refresh saat frame "logs_updated".
   AsyncCallbackJsonWebHandler* eh = new AsyncCallbackJsonWebHandler("/api/log/edit",
     [](AsyncWebServerRequest* req, JsonVariant& json) {
-      if (!sd_ok) { req->send(503, "application/json", "{\"ok\":false,\"err\":\"sd_not_ready\"}"); return; }
+      if (!fb_ok) { req->send(503, "application/json", "{\"ok\":false,\"err\":\"fb_not_ready\"}"); return; }
       if (!req->hasParam("id")) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"need_id\"}"); return; }
-      int wantId = req->getParam("id")->value().toInt();
+      String docId = req->getParam("id")->value();
+      if (docId.length() == 0 || docId.length() > 40 || docId.indexOf('/') >= 0) {
+        req->send(400, "application/json", "{\"ok\":false,\"err\":\"bad_id\"}");
+        return;
+      }
       JsonObject o = json.as<JsonObject>();
       String vehicle = o["vehicle"] | "";
       String plate   = o["plate"]   | "";
       vehicle.trim(); plate.trim();
       if (vehicle.length() > 40) vehicle = vehicle.substring(0, 40);
       if (plate.length()   > 20) plate   = plate.substring(0, 20);
-      if (!ioLock(500)) { req->send(503, "application/json", "{\"ok\":false,\"err\":\"busy\"}"); return; }
-      bool ok = editLogEntry(wantId, vehicle, plate);
-      ioUnlock();
-      if (ok) {
-        SdJob r{SDJOB_REBUILD, nullptr};
-        xQueueSend(sdQueue, &r, 0);   // refresh cache daftar log
-        req->send(200, "application/json", "{\"ok\":true}");
+      FbJob job{FBJOB_EDIT, new String(docId), new String(vehicle), new String(plate)};
+      if (xQueueSend(fbQueue, &job, 0) == pdTRUE) {
+        req->send(200, "application/json", "{\"ok\":true,\"queued\":true}");
       } else {
-        req->send(404, "application/json", "{\"ok\":false,\"err\":\"id_not_found\"}");
+        delete job.a; delete job.b; delete job.c;
+        req->send(503, "application/json", "{\"ok\":false,\"err\":\"busy\"}");
       }
     });
   server.addHandler(eh);
 
-  // DELETE /api/logs     -> hapus semua log
+  // DELETE /api/logs     -> antrikan hapus semua dokumen ke fbTask
   server.on("/api/logs", HTTP_DELETE, [](AsyncWebServerRequest* req){
-    if (!sd_ok) { req->send(503, "application/json", "{\"err\":\"sd_not_ready\"}"); return; }
-    if (!ioLock(500)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
-    if (SD.exists(LOG_PATH)) SD.remove(LOG_PATH);
-    ioUnlock();
-    SdJob r{SDJOB_REBUILD, nullptr};
-    xQueueSend(sdQueue, &r, 0);
-    req->send(200, "application/json", "{\"ok\":true}");
+    if (!fb_ok) { req->send(503, "application/json", "{\"err\":\"fb_not_ready\"}"); return; }
+    FbJob r{FBJOB_DELETE_ALL, nullptr, nullptr, nullptr};
+    if (xQueueSend(fbQueue, &r, 0) == pdTRUE) {
+      req->send(200, "application/json", "{\"ok\":true,\"queued\":true}");
+    } else {
+      req->send(503, "application/json", "{\"err\":\"busy\"}");
+    }
   });
 
   server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
@@ -1770,7 +1836,7 @@ void setup() {
   bootStep(2, "TFT + Touch",  1);
   bootStep(3, "LittleFS",     0);
   bootStep(4, "Settings",     0);
-  bootStep(5, "SD Card",      0);
+  bootStep(5, "Firebase",     0);
   bootStep(6, "WiFi",         0);
   bootStep(7, "NTP+mDNS",     0);
   bootStep(8, "Web Server",   0);
@@ -1791,49 +1857,16 @@ void setup() {
   char detail[24]; snprintf(detail, sizeof(detail), "%u idx", (unsigned)cfg.indices.size());
   bootStep(4, "Settings", 1, detail);
 
-  // --- SD Card ---
-  ioMutex = xSemaphoreCreateMutex();   // lock tunggal bus SPI + cache (lihat komentar global)
-  Serial.println("    SD.begin...");
-  // SD share SPI dengan TFT/touch. Pastikan slave lain deselect, lalu coba beberapa frekuensi.
+  // --- Storage (Firebase Firestore) ---
+  ioMutex = xSemaphoreCreateMutex();   // lock bus SPI (TFT/touch) + logsCache
+  // Slot SD di modul TFT tidak dipakai lagi — CS tetap HIGH agar tidak mengganggu bus
   digitalWrite(TFT_CS,   HIGH);
   digitalWrite(TOUCH_CS, HIGH);
   digitalWrite(SD_CS,    HIGH);
-  delay(10);
-  sd_ok = false;
-  const uint32_t sdFreqs[] = { 1000000, 4000000, 400000 };
-  for (uint8_t i = 0; i < 3 && !sd_ok; i++) {
-    SD.end();
-    delay(20);
-    if (SD.begin(SD_CS, SPI, sdFreqs[i])) { sd_ok = true; break; }
-    Serial.printf("    SD retry (freq=%u) failed\n", (unsigned)sdFreqs[i]);
-  }
-  if (sd_ok) {
-    uint64_t mb = SD.cardSize() / (1024*1024);
-    char sdDetail[24]; snprintf(sdDetail, sizeof(sdDetail), "%llu MB", mb);
-    Serial.printf("    SD OK (%llu MB)\n", mb);
-    // Self-test tulis->baca balik->hapus: kartu palsu/rusak bisa "menerima"
-    // tulisan tapi membuang datanya — ketahuan di sini, bukan saat simpan log.
-    {
-      File t = SD.open("/sdtest.tmp", FILE_WRITE);
-      size_t tn = t ? t.print("OK") : 0;
-      if (t) t.close();
-      delay(10);
-      File r = SD.open("/sdtest.tmp", FILE_READ);
-      String rb = r ? r.readString() : String("");
-      if (r) r.close();
-      delay(10);
-      SD.remove("/sdtest.tmp");
-      bool pass = (tn == 2 && rb == "OK");
-      Serial.printf("    SD self-test: write=%u read='%s' -> %s\n",
-                    (unsigned)tn, rb.c_str(),
-                    pass ? "PASS" : "FAIL (kartu tidak menyimpan data! ganti kartu)");
-      if (!pass) sd_ok = false;   // jangan pura-pura sehat: web tampilkan SD bermasalah
-    }
-    bootStep(5, "SD Card", sd_ok ? 1 : 2, sd_ok ? sdDetail : "self-test FAIL");
-  } else {
-    Serial.println("    SD FAIL");
-    bootStep(5, "SD Card", 2, "no card");
-  }
+  // Auth Firebase dikerjakan async oleh fbTask setelah WiFi siap (HTTPS lambat,
+  // jangan blokir boot). Status final terlihat di serial "[FB] auth ..." & web.
+  Serial.println("    Firebase: auth ditunda ke fbTask (REST API)");
+  bootStep(5, "Firebase", 1, "REST API");
 
   // --- WiFi ---
   Serial.println("    Connecting WiFi...");
@@ -1885,13 +1918,13 @@ void setup() {
   tftDrawIdle();
   lastTftState = ST_IDLE;
 
-  // Worker SD di CORE 0 — dibuat SETELAH semua gambar boot TFT selesai (tidak
-  // ada akses SPI tanpa lock yang tumpang-tindih). server.begin() paling akhir:
-  // handler baru boleh menerima request saat ioMutex & sdQueue sudah siap.
-  sdQueue = xQueueCreate(8, sizeof(SdJob));
-  xTaskCreatePinnedToCore(sdTaskLoop, "sdTask", 8192, nullptr, 1, nullptr, 0);
-  SdJob initJob{SDJOB_REBUILD, nullptr};
-  xQueueSend(sdQueue, &initJob, 0);   // isi cache daftar log saat boot
+  // Worker Firebase di CORE 0 — stack besar (TLS/HTTPS butuh ~10KB stack).
+  // server.begin() paling akhir: handler baru boleh menerima request saat
+  // ioMutex & fbQueue sudah siap.
+  fbQueue = xQueueCreate(8, sizeof(FbJob));
+  xTaskCreatePinnedToCore(fbTaskLoop, "fbTask", 12288, nullptr, 1, nullptr, 0);
+  FbJob initJob{FBJOB_REBUILD, nullptr, nullptr, nullptr};
+  xQueueSend(fbQueue, &initJob, 0);   // auth + isi cache daftar log saat boot
   server.begin();
   Serial.println("    Web OK");
   Serial.println("=== READY ===");
@@ -1913,7 +1946,7 @@ void loop() {
   calibTick();   // kalibrasi non-blocking (no-op jika tidak aktif)
 
   // Touch + TFT = satu-satunya pengguna SPI di loopTask. Try-lock singkat:
-  // kalau sdTask (core 0) sedang pegang bus, frame ini di-skip dan dicoba lagi
+  // kalau lock cache sedang dipegang, frame ini di-skip dan dicoba lagi
   // iterasi berikutnya — state machine, sensor, dan web TIDAK ikut menunggu.
   static uint32_t lastTouchPoll = 0;
   if (now - lastTouchPoll >= TOUCH_POLL_MS) {
@@ -1935,13 +1968,18 @@ void loop() {
     ioUnlock();
   }
 
-  // sdTask selesai menyimpan -> kabari web (note di kartu hasil + refresh tabel log)
+  // fbTask selesai menyimpan -> kabari web (note di kartu hasil)
   if (logSaveNotify) {
     logSaveNotify = false;
     JsonDocument d;
     d["type"] = "log_saved";
     d["ok"]   = (logSaveState == 1);
     String s; serializeJson(d, s); wsSend(s);
+  }
+  // Cache daftar log berubah (save/edit/hapus selesai di fbTask) -> web refresh tabel
+  if (logsUpdatedNotify) {
+    logsUpdatedNotify = false;
+    wsSend("{\"type\":\"logs_updated\"}");
   }
 
   if (now - lastBroadcast > 200) {
