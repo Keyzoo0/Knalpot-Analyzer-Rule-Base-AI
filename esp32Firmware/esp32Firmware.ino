@@ -85,7 +85,6 @@ const char* WIFI_PASS = "20517420";
 #define FB_EMAIL      "admin@gmail.com"
 #define FB_PASSWORD   "admin123"
 #define FS_COLLECTION "logs"     // nama koleksi Firestore untuk data log
-#define FS_PAGE_SIZE  20         // jumlah log terbaru yang di-cache (hemat RAM)
 
 // ---------------- ADC / Sensor constants ----------------
 // === Pembagi tegangan untuk turunkan Vout MQ (5V) ke level ADC ESP32 (3.3V) ===
@@ -202,23 +201,19 @@ bool fb_ok = false;                     // true setelah auth Firebase pertama su
 // --- Arsitektur dual-core ---
 // Core 1 (loopTask)  : sensor ADC, state machine, buzzer, TFT + touch, broadcast WS,
 //                      kalibrasi non-blocking. TIDAK PERNAH melakukan HTTP.
-// Core 0 (fbTask)    : SEMUA komunikasi Firebase Firestore (auth, simpan log,
-//                      ambil daftar, edit, hapus) via antrian job — HTTPS bisa
-//                      makan waktu detik, haram di loopTask & async_tcp (WDT 5s).
-// async_tcp (HTTP/WS): tidak pernah I/O lama. /api/logs dilayani cache RAM;
-//                      edit/hapus hanya MENGANTRIKAN job lalu respon instan.
-// ioMutex melindungi bus SPI (TFT/touch) + logsCache. Tidak pernah nested ->
-// bebas deadlock. TFT/touch pakai try-lock singkat (skip frame jika sibuk).
+// Core 0 (fbTask)    : ESP32 WRITE-ONLY ke Firestore — auth + upload 1 dokumen
+//                      saat selesai system run, via antrian job. (Pembacaan,
+//                      edit, dan hapus log dilakukan WEB langsung ke Firestore
+//                      dengan Firebase JS SDK + realtime listener onSnapshot.)
+// async_tcp (HTTP/WS): tidak pernah I/O lama.
+// ioMutex melindungi bus SPI (TFT/touch). Tidak pernah nested -> bebas deadlock.
 SemaphoreHandle_t ioMutex = nullptr;
 QueueHandle_t fbQueue = nullptr;
-enum FbJobType : uint8_t { FBJOB_SAVE, FBJOB_REBUILD, FBJOB_EDIT, FBJOB_DELETE_ALL };
-// a/b/c milik penerima (di-delete fbTask): SAVE a=json entry; EDIT a=docId b=vehicle c=plate
-struct FbJob { FbJobType type; String* a; String* b; String* c; };
-String logsCache = "[]";                // cache daftar log utk GET /api/logs (full, termasuk samples)
+enum FbJobType : uint8_t { FBJOB_SAVE };
+struct FbJob { FbJobType type; String* payload; };   // payload di-delete fbTask
 // Status simpan log run terakhir: -1 belum ada, 0 gagal, 1 tersimpan, 2 sedang menyimpan
 volatile int8_t logSaveState = -1;
 volatile bool   logSaveNotify = false;     // fbTask -> loop: kirim frame WS "log_saved"
-volatile bool   logsUpdatedNotify = false; // fbTask -> loop: frame WS "logs_updated" (refresh tabel)
 
 bool ioLock(uint32_t ms) { return ioMutex && xSemaphoreTake(ioMutex, pdMS_TO_TICKS(ms)) == pdTRUE; }
 void ioUnlock()          { if (ioMutex) xSemaphoreGive(ioMutex); }
@@ -673,14 +668,6 @@ String fsBaseUrl() {
          "/databases/" FB_DATABASE_ID "/documents/" + FS_COLLECTION;
 }
 
-// Endpoint structured query. Daftar log memakai :runQuery (bukan documents.list)
-// karena list GET ditolak rules pada beberapa setup, sedangkan runQuery dievaluasi
-// normal — terbukti saat pengujian project ini (list=403, runQuery=200).
-String fsQueryUrl() {
-  return String("https://firestore.googleapis.com/v1/projects/") + FB_PROJECT_ID +
-         "/databases/" FB_DATABASE_ID "/documents:runQuery";
-}
-
 // Request Firestore generik (POST/PATCH/DELETE) — respon kecil, body dibuang.
 int fsRequest(const char* method, const String& url, const String& body) {
   WiFiClientSecure client;
@@ -760,7 +747,7 @@ void saveLogEntry() {
 
   String* line = new String();
   serializeJson(d, *line);
-  FbJob job{FBJOB_SAVE, line, nullptr, nullptr};
+  FbJob job{FBJOB_SAVE, line};
   if (xQueueSend(fbQueue, &job, 0) == pdTRUE) {
     logSaveState = 2;   // pending — fbTask di core 0 yang menuntaskan upload
   } else {
@@ -770,166 +757,32 @@ void saveLogEntry() {
   }
 }
 
-// Ambil daftar log terbaru dari Firestore -> cache RAM (dipakai GET /api/logs
-// dan modal detail di web). Hemat RAM: respon Firestore yang verbose di-parse
-// streaming dengan filter (hanya field yang dibutuhkan yang masuk heap).
-bool fbRebuildCache() {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.useHTTP10(true);   // matikan chunked encoding supaya stream bisa di-parse
-  if (!http.begin(client, fsQueryUrl())) return false;
-  http.addHeader("Authorization", String("Bearer ") + fbToken);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(15000);
-  String q = String("{\"structuredQuery\":{\"from\":[{\"collectionId\":\"" FS_COLLECTION "\"}],"
-                    "\"orderBy\":[{\"field\":{\"fieldPath\":\"created\"},\"direction\":\"DESCENDING\"}],"
-                    "\"limit\":") + FS_PAGE_SIZE + "}}";
-  int code = http.POST(q);
-  if (code != 200) {
-    Serial.printf("[CACHE] runQuery HTTP %d\n", code);
-    http.end();
-    return false;
-  }
-  // Respon = array [{document:{name,fields},readTime}, ...]; koleksi kosong ->
-  // item tanpa key "document". Filter: hanya name + fields yang masuk heap.
-  JsonDocument filter;
-  filter[0]["document"]["name"] = true;
-  filter[0]["document"]["fields"] = true;
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-  http.end();
-  if (err) {
-    Serial.printf("[CACHE] parse: %s\n", err.c_str());
-    return false;
-  }
-
-  JsonDocument outDoc;
-  JsonArray arr = outDoc.to<JsonArray>();
-  for (JsonObject item : doc.as<JsonArray>()) {
-    JsonObject docu = item["document"];
-    if (docu.isNull()) continue;          // entri readTime-only (koleksi kosong)
-    JsonObject fl = docu["fields"];
-    String name = docu["name"].as<String>();          // projects/.../documents/logs/<docId>
-    JsonObject o = arr.add<JsonObject>();
-    o["id"]      = name.substring(name.lastIndexOf('/') + 1);
-    o["ts"]      = fl["ts"]["stringValue"]        | "";
-    o["vehicle"] = fl["vehicle"]["stringValue"]   | "";
-    o["plate"]   = fl["plate"]["stringValue"]     | "";
-    o["idx"]     = fl["idx_label"]["stringValue"] | "";
-    o["th_hc"]   = fl["th_hc"]["doubleValue"]  | 0.0f;
-    o["th_co"]   = fl["th_co"]["doubleValue"]  | 0.0f;
-    o["avg_hc"]  = fl["avg_hc"]["doubleValue"] | 0.0f;
-    o["avg_co"]  = fl["avg_co"]["doubleValue"] | 0.0f;
-    o["code"]    = atoi(fl["code"]["integerValue"] | "0");
-    o["n"]       = atoi(fl["n"]["integerValue"]    | "0");
-    o["label"]   = fl["label"]["stringValue"] | "";
-    JsonArray sh = o["s_hc"].to<JsonArray>();
-    for (JsonObject v : fl["s_hc"]["arrayValue"]["values"].as<JsonArray>()) sh.add(v["doubleValue"] | 0.0f);
-    JsonArray sc = o["s_co"].to<JsonArray>();
-    for (JsonObject v : fl["s_co"]["arrayValue"]["values"].as<JsonArray>()) sc.add(v["doubleValue"] | 0.0f);
-  }
-  String out;
-  serializeJson(outDoc, out);
-  if (ioLock(2000)) { logsCache = out; ioUnlock(); }
-  Serial.printf("[CACHE] rebuilt: %d entri dari Firestore (heap=%u)\n",
-                (int)arr.size(), ESP.getFreeHeap());
-  return true;
-}
-
-// PATCH vehicle & plate satu dokumen (updateMask agar field lain tidak tertimpa)
-bool fbEditLog(const String& docId, const String& vehicle, const String& plate) {
-  JsonDocument d;
-  d["fields"]["vehicle"]["stringValue"] = vehicle;
-  d["fields"]["plate"]["stringValue"]   = plate;
-  String body; serializeJson(d, body);
-  String url = fsBaseUrl() + "/" + docId +
-               "?updateMask.fieldPaths=vehicle&updateMask.fieldPaths=plate";
-  return fsRequest("PATCH", url, body) == 200;
-}
-
-// Hapus semua dokumen koleksi: runQuery nama dokumen (select __name__, hemat RAM)
-// lalu DELETE satu per satu, diulang sampai koleksi kosong.
-bool fbDeleteAll() {
-  for (int round = 0; round < 10; round++) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.useHTTP10(true);
-    if (!http.begin(client, fsQueryUrl())) return false;
-    http.addHeader("Authorization", String("Bearer ") + fbToken);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(15000);
-    String q = "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"" FS_COLLECTION "\"}],"
-               "\"select\":{\"fields\":[{\"fieldPath\":\"__name__\"}]},\"limit\":50}}";
-    if (http.POST(q) != 200) { http.end(); return false; }
-    JsonDocument filter;
-    filter[0]["document"]["name"] = true;
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-    http.end();
-    if (err) return false;
-    int deleted = 0;
-    for (JsonObject item : doc.as<JsonArray>()) {
-      JsonObject docu = item["document"];
-      if (docu.isNull()) continue;
-      String name = docu["name"].as<String>();
-      String docId = name.substring(name.lastIndexOf('/') + 1);
-      fsRequest("DELETE", fsBaseUrl() + "/" + docId, "");
-      deleted++;
-      vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    if (deleted == 0) return true;   // koleksi kosong -> selesai
-  }
-  return true;
-}
-
-// Worker Firebase di CORE 0 — satu-satunya yang melakukan HTTP/HTTPS.
-// Ambil job dari antrian, pastikan WiFi + token, eksekusi, lapor ke loopTask.
+// Worker Firebase di CORE 0 — ESP32 WRITE-ONLY: hanya upload dokumen log saat
+// selesai system run. Pastikan WiFi + token tiap job, retry sekali jika gagal.
 void fbTaskLoop(void*) {
+  // Auth awal: tunggu WiFi (maks ~10 detik) lalu login sekali, supaya status
+  // fb_ok di web/TFT benar tanpa harus menunggu run pertama.
+  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) vTaskDelay(pdMS_TO_TICKS(250));
+  if (WiFi.status() == WL_CONNECTED) fbEnsureAuth();
   FbJob job;
   for (;;) {
     if (xQueueReceive(fbQueue, &job, portMAX_DELAY) != pdTRUE) continue;
     bool ready = (WiFi.status() == WL_CONNECTED) && fbEnsureAuth();
-
-    if (job.type == FBJOB_SAVE) {
-      bool ok = false;
-      if (ready) {
-        String body;
-        if (toFirestoreDoc(*job.a, body)) {
-          ok = (fsRequest("POST", fsBaseUrl(), body) == 200);
-          if (!ok) {   // retry sekali: token/jaringan bisa baru saja pulih
-            vTaskDelay(pdMS_TO_TICKS(500));
-            if (fbAuth()) ok = (fsRequest("POST", fsBaseUrl(), body) == 200);
-          }
+    bool ok = false;
+    if (ready) {
+      String body;
+      if (toFirestoreDoc(*job.payload, body)) {
+        ok = (fsRequest("POST", fsBaseUrl(), body) == 200);
+        if (!ok) {   // retry sekali: token/jaringan bisa baru saja pulih
+          vTaskDelay(pdMS_TO_TICKS(500));
+          if (fbAuth()) ok = (fsRequest("POST", fsBaseUrl(), body) == 200);
         }
       }
-      delete job.a;
-      logSaveState = ok ? 1 : 0;
-      logSaveNotify = true;
-      Serial.printf("[LOG] %s (Firestore, heap=%u)\n", ok ? "saved" : "SAVE FAIL", ESP.getFreeHeap());
-      if (ok) {
-        FbJob r{FBJOB_REBUILD, nullptr, nullptr, nullptr};
-        xQueueSend(fbQueue, &r, 0);   // refresh cache daftar log
-      }
-    } else if (job.type == FBJOB_REBUILD) {
-      if (ready && fbRebuildCache()) logsUpdatedNotify = true;
-    } else if (job.type == FBJOB_EDIT) {
-      bool ok = ready && fbEditLog(*job.a, *job.b, *job.c);
-      delete job.a; delete job.b; delete job.c;
-      Serial.printf("[LOG] edit %s\n", ok ? "OK" : "FAIL");
-      if (ok) {
-        FbJob r{FBJOB_REBUILD, nullptr, nullptr, nullptr};
-        xQueueSend(fbQueue, &r, 0);
-      }
-    } else if (job.type == FBJOB_DELETE_ALL) {
-      bool ok = ready && fbDeleteAll();
-      Serial.printf("[LOG] delete-all %s\n", ok ? "OK" : "FAIL");
-      if (ok) {
-        if (ioLock(2000)) { logsCache = "[]"; ioUnlock(); }
-        logsUpdatedNotify = true;
-      }
     }
+    delete job.payload;
+    logSaveState = ok ? 1 : 0;
+    logSaveNotify = true;
+    Serial.printf("[LOG] %s (Firestore, heap=%u)\n", ok ? "saved" : "SAVE FAIL", ESP.getFreeHeap());
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
@@ -1177,70 +1030,9 @@ void registerRoutes() {
     req->send(200, "application/json", s);
   });
 
-  // === LOG endpoints (Firebase Firestore) ===
-  // ATURAN: handler jalan di task async_tcp (task watchdog 5 detik) — TIDAK boleh
-  // melakukan HTTP. Daftar log dilayani CACHE RAM (diisi fbTask); edit/hapus
-  // hanya MENGANTRIKAN job ke fbTask lalu respon instan. Detail entry tidak
-  // butuh endpoint: cache sudah berisi data lengkap (termasuk samples).
-
-  // GET /api/logs/download -> export cache sebagai file JSON.
-  // Didaftarkan SEBELUM "/api/logs" (ESPAsyncWebServer mencocokkan prefix).
-  server.on("/api/logs/download", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (!fb_ok) { req->send(404, "text/plain", "no logs"); return; }
-    if (!ioLock(100)) { req->send(503, "text/plain", "busy"); return; }
-    String out = logsCache;
-    ioUnlock();
-    AsyncWebServerResponse* res = req->beginResponse(200, "application/json", out);
-    res->addHeader("Content-Disposition", "attachment; filename=logs.json");
-    req->send(res);
-  });
-
-  // GET /api/logs        -> daftar log lengkap dari CACHE RAM (tanpa HTTP)
-  server.on("/api/logs", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (!fb_ok) { req->send(503, "application/json", "{\"err\":\"fb_not_ready\"}"); return; }
-    if (!ioLock(100)) { req->send(503, "application/json", "{\"err\":\"busy\"}"); return; }
-    String out = logsCache;   // copy singkat di dalam lock (hindari race dgn rebuild)
-    ioUnlock();
-    req->send(200, "application/json", out);
-  });
-
-  // POST /api/log/edit?id=<docId>  body {vehicle, plate} -> antrikan PATCH ke fbTask.
-  // Respon instan {"ok":true,"queued":true}; web refresh saat frame "logs_updated".
-  AsyncCallbackJsonWebHandler* eh = new AsyncCallbackJsonWebHandler("/api/log/edit",
-    [](AsyncWebServerRequest* req, JsonVariant& json) {
-      if (!fb_ok) { req->send(503, "application/json", "{\"ok\":false,\"err\":\"fb_not_ready\"}"); return; }
-      if (!req->hasParam("id")) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"need_id\"}"); return; }
-      String docId = req->getParam("id")->value();
-      if (docId.length() == 0 || docId.length() > 40 || docId.indexOf('/') >= 0) {
-        req->send(400, "application/json", "{\"ok\":false,\"err\":\"bad_id\"}");
-        return;
-      }
-      JsonObject o = json.as<JsonObject>();
-      String vehicle = o["vehicle"] | "";
-      String plate   = o["plate"]   | "";
-      vehicle.trim(); plate.trim();
-      if (vehicle.length() > 40) vehicle = vehicle.substring(0, 40);
-      if (plate.length()   > 20) plate   = plate.substring(0, 20);
-      FbJob job{FBJOB_EDIT, new String(docId), new String(vehicle), new String(plate)};
-      if (xQueueSend(fbQueue, &job, 0) == pdTRUE) {
-        req->send(200, "application/json", "{\"ok\":true,\"queued\":true}");
-      } else {
-        delete job.a; delete job.b; delete job.c;
-        req->send(503, "application/json", "{\"ok\":false,\"err\":\"busy\"}");
-      }
-    });
-  server.addHandler(eh);
-
-  // DELETE /api/logs     -> antrikan hapus semua dokumen ke fbTask
-  server.on("/api/logs", HTTP_DELETE, [](AsyncWebServerRequest* req){
-    if (!fb_ok) { req->send(503, "application/json", "{\"err\":\"fb_not_ready\"}"); return; }
-    FbJob r{FBJOB_DELETE_ALL, nullptr, nullptr, nullptr};
-    if (xQueueSend(fbQueue, &r, 0) == pdTRUE) {
-      req->send(200, "application/json", "{\"ok\":true,\"queued\":true}");
-    } else {
-      req->send(503, "application/json", "{\"err\":\"busy\"}");
-    }
-  });
+  // Catatan: tidak ada endpoint log di ESP32 — web membaca/edit/hapus log
+  // LANGSUNG ke Firestore via Firebase JS SDK (data/firebase.js), realtime
+  // listener onSnapshot. ESP32 hanya MENULIS dokumen saat selesai system run.
 
   server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
 
@@ -1883,7 +1675,7 @@ void setup() {
   bootStep(4, "Settings", 1, detail);
 
   // --- Storage (Firebase Firestore) ---
-  ioMutex = xSemaphoreCreateMutex();   // lock bus SPI (TFT/touch) + logsCache
+  ioMutex = xSemaphoreCreateMutex();   // lock bus SPI (TFT/touch)
   // Slot SD di modul TFT tidak dipakai lagi — CS tetap HIGH agar tidak mengganggu bus
   digitalWrite(TFT_CS,   HIGH);
   digitalWrite(TOUCH_CS, HIGH);
@@ -1948,8 +1740,6 @@ void setup() {
   // ioMutex & fbQueue sudah siap.
   fbQueue = xQueueCreate(8, sizeof(FbJob));
   xTaskCreatePinnedToCore(fbTaskLoop, "fbTask", 12288, nullptr, 1, nullptr, 0);
-  FbJob initJob{FBJOB_REBUILD, nullptr, nullptr, nullptr};
-  xQueueSend(fbQueue, &initJob, 0);   // auth + isi cache daftar log saat boot
   server.begin();
   Serial.println("    Web OK");
   Serial.println("=== READY ===");
@@ -2001,12 +1791,6 @@ void loop() {
     d["ok"]   = (logSaveState == 1);
     String s; serializeJson(d, s); wsSend(s);
   }
-  // Cache daftar log berubah (save/edit/hapus selesai di fbTask) -> web refresh tabel
-  if (logsUpdatedNotify) {
-    logsUpdatedNotify = false;
-    wsSend("{\"type\":\"logs_updated\"}");
-  }
-
   if (now - lastBroadcast > 200) {
     lastBroadcast = now;
     broadcastData();

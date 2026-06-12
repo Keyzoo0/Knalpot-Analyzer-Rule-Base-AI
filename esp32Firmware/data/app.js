@@ -193,19 +193,11 @@ function handleMsg(m) {
     showResult(m);
     updateButtons('RESULT');
     updatePhaseTimeline('RESULT');
-    // Auto refresh tabel log jika tab Log sedang dibuka
-    if (document.getElementById('tab-log').classList.contains('active')) {
-      setTimeout(() => fetchLogs && fetchLogs(), 700);   // beri jeda agar SD selesai menulis
-    }
+    // (tabel log auto-update sendiri via Firestore onSnapshot — tidak perlu refresh)
   } else if (m.type === 'calib_done') {
     calibDone(m);
   } else if (m.type === 'log_saved') {
     updateLogSaveNote(m.ok ? 1 : 0);
-  } else if (m.type === 'logs_updated') {
-    // cache daftar log di ESP32 baru di-sync dari Firestore -> refresh tabel
-    if (document.getElementById('tab-log').classList.contains('active')) {
-      fetchLogs && fetchLogs();
-    }
   }
 }
 
@@ -521,67 +513,65 @@ const RESULT_BADGES = [
   { bg:'bg-red-100',     tx:'text-red-700'     },  // 3 tidak normal
 ];
 
-let logsData = [];   // cache daftar log dari ESP32 (sudah lengkap, termasuk samples)
+// Data log datang dari Firestore LANGSUNG via firebase.js (realtime listener
+// onSnapshot) — ESP32 tidak lagi melayani daftar log. Event 'fb-logs' membawa
+// array lengkap (termasuk samples) tiap kali ada perubahan di Firestore.
+let logsData = [];
 
-async function fetchLogs(){
+function renderLogsTable(arr){
   const body = document.getElementById('logBody');
-  body.innerHTML = '<tr><td colspan="9" class="text-center py-6 text-ink-400">Memuat...</td></tr>';
   document.getElementById('logEmpty').classList.add('hidden');
-  document.getElementById('logSdWarn').classList.add('hidden');
-  try {
-    const r = await fetch('/api/logs');
-    if (r.status === 503) {
-      let err = '';
-      try { err = (await r.json()).err || ''; } catch (_) {}
-      if (err === 'busy') {
-        // cache sedang di-update fbTask (transient) — auto-refresh akan retry
-        document.getElementById('logCount').textContent = '— sibuk, mencoba lagi...';
-        return;
-      }
-      document.getElementById('logSdWarn').classList.remove('hidden');
-      body.innerHTML = '';
-      document.getElementById('logCount').textContent = '— Firebase tidak terhubung';
-      return;
-    }
-    const arr = await r.json();
-    logsData = arr;
-    document.getElementById('logCount').textContent = `${arr.length} entri`;
-    body.innerHTML = '';
-    if (arr.length === 0) {
-      document.getElementById('logEmpty').classList.remove('hidden');
-      return;
-    }
-    // urutan dari server sudah terbaru -> terlama (orderBy created desc)
-    arr.forEach((e, i) => {
-      const bg = RESULT_BADGES[e.code]?.bg || 'bg-ink-100';
-      const tx = RESULT_BADGES[e.code]?.tx || 'text-ink-700';
-      const tr = document.createElement('tr');
-      tr.className = 'hover:bg-ink-50';
-      const vehicle = (e.vehicle || '').trim();
-      const plate   = (e.plate || '').trim();
-      tr.innerHTML = `
-        <td class="px-3 py-2 mono text-ink-400">#${arr.length - i}</td>
-        <td class="px-3 py-2 mono text-xs">${e.ts || '-'}</td>
-        <td class="px-3 py-2">${vehicle ? escapeHtml(vehicle) : '<span class="text-ink-300 italic">—</span>'}</td>
-        <td class="px-3 py-2 mono uppercase">${plate ? escapeHtml(plate) : '<span class="text-ink-300 italic">—</span>'}</td>
-        <td class="px-3 py-2">${escapeHtml(e.idx || '-')}</td>
-        <td class="px-3 py-2 mono text-right">${(+e.avg_hc).toFixed(1)}</td>
-        <td class="px-3 py-2 mono text-right">${(+e.avg_co).toFixed(2)}</td>
-        <td class="px-3 py-2"><span class="inline-block px-2 py-0.5 rounded text-xs font-semibold ${bg} ${tx}">${escapeHtml(e.label || '-')}</span></td>
-        <td class="px-3 py-2 text-right">
-          <button data-detail="${i}" class="inline-flex items-center gap-1 px-2 py-1 rounded bg-blue-50 hover:bg-blue-100 text-blue-700 text-xs font-semibold">
-            Detail
-          </button>
-        </td>`;
-      body.appendChild(tr);
-    });
-    body.querySelectorAll('button[data-detail]').forEach(b => {
-      b.addEventListener('click', () => openLogDetail(+b.dataset.detail));
-    });
-  } catch(e) {
-    body.innerHTML = '<tr><td colspan="9" class="text-center py-6 text-red-500">Gagal memuat log</td></tr>';
+  document.getElementById('logCount').textContent = `${arr.length} entri`;
+  body.innerHTML = '';
+  if (arr.length === 0) {
+    document.getElementById('logEmpty').classList.remove('hidden');
+    return;
   }
+  // urutan dari Firestore sudah terbaru -> terlama (orderBy created desc)
+  arr.forEach((e, i) => {
+    const bg = RESULT_BADGES[e.code]?.bg || 'bg-ink-100';
+    const tx = RESULT_BADGES[e.code]?.tx || 'text-ink-700';
+    const tr = document.createElement('tr');
+    tr.className = 'hover:bg-ink-50';
+    const vehicle = (e.vehicle || '').trim();
+    const plate   = (e.plate || '').trim();
+    tr.innerHTML = `
+      <td class="px-3 py-2 mono text-ink-400">#${arr.length - i}</td>
+      <td class="px-3 py-2 mono text-xs">${e.ts || '-'}</td>
+      <td class="px-3 py-2">${vehicle ? escapeHtml(vehicle) : '<span class="text-ink-300 italic">—</span>'}</td>
+      <td class="px-3 py-2 mono uppercase">${plate ? escapeHtml(plate) : '<span class="text-ink-300 italic">—</span>'}</td>
+      <td class="px-3 py-2">${escapeHtml(e.idx || '-')}</td>
+      <td class="px-3 py-2 mono text-right">${(+e.avg_hc).toFixed(1)}</td>
+      <td class="px-3 py-2 mono text-right">${(+e.avg_co).toFixed(2)}</td>
+      <td class="px-3 py-2"><span class="inline-block px-2 py-0.5 rounded text-xs font-semibold ${bg} ${tx}">${escapeHtml(e.label || '-')}</span></td>
+      <td class="px-3 py-2 text-right">
+        <button data-detail="${i}" class="inline-flex items-center gap-1 px-2 py-1 rounded bg-blue-50 hover:bg-blue-100 text-blue-700 text-xs font-semibold">
+          Detail
+        </button>
+      </td>`;
+    body.appendChild(tr);
+  });
+  body.querySelectorAll('button[data-detail]').forEach(b => {
+    b.addEventListener('click', () => openLogDetail(+b.dataset.detail));
+  });
 }
+
+// Realtime: tiap snapshot Firestore berubah, tabel di-render ulang
+window.addEventListener('fb-logs', (ev) => {
+  logsData = ev.detail || [];
+  renderLogsTable(logsData);
+});
+window.addEventListener('fb-status', (ev) => {
+  const warn = document.getElementById('logSdWarn');
+  if (ev.detail.ok) warn.classList.add('hidden');
+  else {
+    warn.classList.remove('hidden');
+    document.getElementById('logCount').textContent = '— Firebase tidak terhubung';
+  }
+});
+
+// dipertahankan utk tombol Refresh / pembuka tab (render dari data terakhir)
+function fetchLogs(){ renderLogsTable(logsData); }
 
 function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -650,22 +640,13 @@ document.getElementById('btnLogSaveMeta').addEventListener('click', async () => 
   msg.textContent = 'Menyimpan...';
   msg.className = 'text-sm font-medium text-amber-700';
   try {
-    const r = await fetch('/api/log/edit?id=' + encodeURIComponent(logEditId), {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ vehicle, plate })
-    });
-    const j = await r.json();
-    if (j.ok) {
-      msg.textContent = '✓ Tersimpan (sinkronisasi Firebase...)';
-      msg.className = 'text-sm font-medium text-emerald-600';
-      // tabel di-refresh saat frame WS "logs_updated"; fallback kalau frame drop:
-      setTimeout(fetchLogs, 4000);
-    } else {
-      msg.textContent = '✗ ' + (j.err || 'gagal');
-      msg.className = 'text-sm font-medium text-red-600';
-    }
+    // tulis langsung ke Firestore dari browser; tabel auto-update via onSnapshot
+    if (!window.fbLogsUpdate) throw new Error('firebase belum siap');
+    await window.fbLogsUpdate(logEditId, { vehicle, plate });
+    msg.textContent = '✓ Tersimpan';
+    msg.className = 'text-sm font-medium text-emerald-600';
   } catch(e) {
-    msg.textContent = '✗ koneksi gagal';
+    msg.textContent = '✗ gagal: ' + (e.code || e.message || 'koneksi');
     msg.className = 'text-sm font-medium text-red-600';
   } finally {
     btn.disabled = false;
@@ -675,14 +656,23 @@ document.getElementById('btnLogSaveMeta').addEventListener('click', async () => 
 document.getElementById('btnLogRefresh').addEventListener('click', fetchLogs);
 document.getElementById('btnLogClear').addEventListener('click', async () => {
   if (!confirm('Hapus SEMUA log di Firebase? Aksi ini tidak bisa dibatalkan.')) return;
-  const r = await fetch('/api/logs', { method: 'DELETE' });
-  if (r.ok) {
+  try {
+    if (!window.fbLogsDeleteAll) throw new Error('firebase belum siap');
     document.getElementById('logCount').textContent = '— menghapus di Firebase...';
-    // tabel refresh saat frame WS "logs_updated"; fallback kalau frame drop:
-    setTimeout(fetchLogs, 6000);
-  } else {
-    alert('Gagal menghapus');
+    await window.fbLogsDeleteAll();
+    // tabel auto-update via onSnapshot
+  } catch(e) {
+    alert('Gagal menghapus: ' + (e.code || e.message));
   }
+});
+// Download: export data listener sebagai file JSON (client-side, tanpa ESP32)
+document.getElementById('btnLogDownload').addEventListener('click', () => {
+  const blob = new Blob([JSON.stringify(logsData, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'logs.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
 });
 
 // (Auto-refresh log saat RESULT sudah di-hook dari handleMsg() di atas.)
